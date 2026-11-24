@@ -1,7 +1,7 @@
 # Build the Firmware Binaries Automatically
-> ⚠️ Only the unified .ino file is supported
+> ⚠️ Only a unified .ino file is supported
 1. Fork the repository
-2. Go to repository settings > general > actions from the bottom check
+2. Go to repository settings > actions > general then from the bottom just check
    ✓ Read and write permissions
    ✓ Allow GitHub Actions to create and approve pull requests
 3. Edit and paste your code inside `sketch.ino` or make any filename.ino 
