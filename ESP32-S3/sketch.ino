@@ -59,6 +59,41 @@ static const size_t NOTIFY_CHUNK = 20;
 static const uint8_t POLL_REQ_LEN = 0xBE;
 static const uint32_t POLL_INTERVAL_MS = 1000;
 
+/* 空闲保活间隔：没有手机连接时，也要每隔这么久问一次 BMS。
+ * 为什么不能完全停：部分 BMS 在长时间收不到请求后会主动断开链路，
+ * 那样等手机连上来时要重新建链（2~4 秒），官方 App 的探测窗口可能因此超时。
+ * 10 秒是一次很轻的请求，功耗远低于 1 Hz 轮询。 */
+static const uint32_t POLL_IDLE_KEEPALIVE_MS = 10000UL;
+
+/* 置 true 表示下一轮循环立刻轮询一次（手机刚接入时用） */
+static volatile bool gPollNow = false;
+
+/* 深度休眠：无手机连接持续一段时间后，直接断开与 BMS 的链路以省电。
+ * 代价是手机接入后要重新建链（约 2~4 秒）才有数据。默认关闭。 */
+static const uint32_t DEEP_IDLE_MS = 300000UL;   /* 空闲 5 分钟后断开 */
+bool     cfgDeepSleep   = false;                 /* 用户开关，存 NVS */
+bool     gBmsSuspended  = false;                 /* true = 已因深度休眠而断开，暂停自动重连 */
+uint32_t gIdleSince     = 0;                     /* 无手机连接的起始时刻，0 表示未开始计时 */
+
+/* ---------------------------- 板载 LED 控制 ---------------------------- */
+/* ESP32-S3 开发板的板载灯常见两种：
+ *   - 简单 LED（多为 GPIO2，高电平点亮）
+ *   - WS2812 RGB（多为 GPIO48，低电平=熄灭）
+ * 两种都只需把引脚拉到"熄灭电平"即可关灯，所以用 digitalWrite 就够。
+ * 默认引脚 48（S3-DevKitC-1 常见），可在网页里改。 */
+uint8_t cfgLedPin    = 48;
+bool    cfgLedOff    = false;   /* true = 关闭板载灯 */
+bool    cfgLedInvert = false;   /* true = 低电平点亮（部分板子是这种） */
+
+void applyLedState() {
+  pinMode(cfgLedPin, OUTPUT);
+  /* 点亮电平：普通板 HIGH，反相板 LOW */
+  int onLevel  = cfgLedInvert ? LOW : HIGH;
+  int offLevel = cfgLedInvert ? HIGH : LOW;
+  digitalWrite(cfgLedPin, cfgLedOff ? offLevel : onLevel);
+  Serial.printf("[LED] GPIO%u %s\n", (unsigned)cfgLedPin, cfgLedOff ? "已关闭" : "已点亮");
+}
+
 /* 最多同时接入的手机数量 */
 static const int MAX_CONN = 3;
 
@@ -421,6 +456,9 @@ volatile bool gNeedRestartAdv = false;
 class PhoneServerCb : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     (void)s;
+    gPollNow = true;                 /* 有手机接入：下一轮立刻向 BMS 要一次数据 */
+    gBmsSuspended = false;           /* 若处于深度休眠，立刻解除，让状态机去重连 */
+    gIdleSince = 0;
     Serial.printf("[Phone] 连接，当前 %d/%d\n", getConnCount(), MAX_CONN);
   }
   void onDisconnect(BLEServer* s) override {
@@ -507,7 +545,6 @@ struct ScanItem {
   int    rssi;
   bool   isAnt;
   bool   hasName;
-  bool   guessed;      /* 名字是从厂商数据里推断出来的 */
   bool   cached;       /* 名字来自本机缓存的已保存设备（对应 Android 的 device.name 缓存） */
 };
 
@@ -634,7 +671,45 @@ input{flex:1}
 </div>
 
 <div class="card">
-  <h2>4. 保存配置</h2>
+  <h2>4. 省电</h2>
+  <div class="row">
+    <label style="display:flex;gap:8px;align-items:center;font-size:14px">
+      <input type="checkbox" id="dsleep" style="flex:0 0 auto;width:18px;height:18px">
+      <span>深度休眠：无手机连接满 5 分钟后断开 BMS 链路</span>
+    </label>
+  </div>
+  <div class="mut">
+    开启后省电更明显，但手机重新连接时需要 2–4 秒重建链路才有数据。<br>
+    关闭时仍会保持低频保活（每 10 秒问一次），不会断开。
+  </div>
+</div>
+
+<div class="card">
+  <h2>5. 板载 LED</h2>
+  <div class="row">
+    <label style="display:flex;gap:8px;align-items:center;font-size:14px">
+      <input type="checkbox" id="ledoff" style="flex:0 0 auto;width:18px;height:18px">
+      <span>关闭板载 LED（省电、避免夜间刺眼）</span>
+    </label>
+  </div>
+  <div class="row">
+    <span class="mut" style="flex:0 0 auto">LED 引脚 GPIO</span>
+    <input id="ledpin" type="number" min="0" max="48" value="48" style="flex:1">
+  </div>
+  <div class="row">
+    <label style="display:flex;gap:8px;align-items:center;font-size:14px">
+      <input type="checkbox" id="ledinv" style="flex:0 0 auto;width:18px;height:18px">
+      <span>低电平点亮（部分板子是这种）</span>
+    </label>
+  </div>
+  <div class="mut">
+    常见值：ESP32-S3-DevKitC-1 的 RGB 灯为 <b>48</b>；部分板子的单色灯为 <b>2</b>。<br>
+    关灯只是把引脚拉到熄灭电平，不影响其他功能。
+  </div>
+</div>
+
+<div class="card">
+  <h2>6. 保存配置</h2>
   <div class="row">
     <button onclick="doSave()">保存配置</button>
   </div>
@@ -660,6 +735,8 @@ function st(){
     bms+'<br>目标：'+(j.bms||'未设置')
    +'<br>中继名：'+j.relay+'　发射功率：'+j.txp+'%（'+j.dbm+'）'
    +'<br>手机连接：<b>'+j.conn+'</b> / '+j.connMax+' 台'
+   +(j.idlePoll?'　<span style="color:#6b7280">（空闲省电：10 秒保活一次）</span>':'')
+   +(j.suspended?'<br><span style="color:#b45309">深度休眠中：BMS 链路已断开，手机接入会自动恢复</span>':'')
    +'<br>收到帧 '+j.framesIn+' · 转发帧 '+j.framesOut+' · 丢弃 '+j.drop;
   if(!chosen && j.mac) { chosen=j.mac; chosenName=j.bmsName; }
   if(chosen && document.getElementById('sel').textContent==='—')
@@ -668,6 +745,14 @@ function st(){
   if(!ri.value) ri.value=j.relay;
   var tp=document.getElementById('txp');
   if(!tp.dataset.touched) tp.value=String(j.txp);
+  var ds=document.getElementById('dsleep');
+  if(!ds.dataset.touched) ds.checked = (j.dsleep==1);
+  var lo=document.getElementById('ledoff');
+  if(!lo.dataset.touched) lo.checked = (j.ledoff==1);
+  var li=document.getElementById('ledinv');
+  if(!li.dataset.touched) li.checked = (j.ledinv==1);
+  var lp=document.getElementById('ledpin');
+  if(!lp.dataset.touched) lp.value = String(j.ledpin);
 
   var w='';
   if(j.wifiOn){
@@ -723,10 +808,9 @@ function renderDevices(){
    e.className='dev'+(d.addr==chosen?' sel':'');
    var tag   = d.ant ? '<span style="color:#16a34a;font-weight:600"> [ANT]</span>' : '';
    var warn  = (!d.hasName) ? '<span style="color:#f59e0b"> [无名称]</span>' : '';
-   var gtag  = d.guess ? '<span style="color:#8b5cf6;font-weight:600"> [厂商数据]</span>' : '';
    var ctag  = d.cached ? '<span style="color:#0ea5e9;font-weight:600"> [已保存]</span>' : '';
    var saved = (d.addr==meta.savedMac) ? '<span style="color:#2563eb;font-weight:600"> [当前目标]</span>' : '';
-   e.innerHTML='<b>'+d.name+'</b>'+tag+warn+gtag+ctag+saved
+   e.innerHTML='<b>'+d.name+'</b>'+tag+warn+ctag+saved
                +'<br><span style="color:#6b7280;font-size:12px">'
                +d.addr+'　RSSI '+d.rssi+' dBm</span>';
    e.onclick=function(){
@@ -775,6 +859,13 @@ function doSave(){
  fd.append('name',chosenName);
  fd.append('relay',document.getElementById('relay').value);
  fd.append('txp',document.getElementById('txp').value);
+ fd.append('dsleep',document.getElementById('dsleep').checked?'1':'0');
+ fd.append('ledoff',document.getElementById('ledoff').checked?'1':'0');
+ fd.append('ledinv',document.getElementById('ledinv').checked?'1':'0');
+ fd.append('ledpin',document.getElementById('ledpin').value);
+ document.getElementById('ledoff').dataset.touched='1';
+ document.getElementById('ledinv').dataset.touched='1';
+ document.getElementById('ledpin').dataset.touched='1';
  m.textContent='保存中…';
  fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
                 body:fd.toString()})
@@ -808,35 +899,6 @@ function wifiCtl(a){
 st(); setInterval(st,2000);
 </script></body></html>)HTML";
 
-/* ------------- 从厂商自定义数据里提取名称 ------------- */
-/* 为什么需要：
- *   标准设备名在 AD type 0x08/0x09（Local Name），Arduino 的 getName() 只读这个。
- *   但不少国产 BMS 把名字塞在 **厂商自定义数据（AD type 0xFF）** 里，
- *   官方 App 自己按私有格式解析，所以它「扫描阶段就能显示名字」，
- *   而我们的 getName() 返回空 —— 这就是差异的根源。
- *
- * 做法：把厂商数据当成字节流，找连续可打印字符（含 UTF-8 中文），
- *   取最长的一段作为名字。属于启发式推断，界面上会标 [厂商数据]。
- */
-static String extractVendorName(BLEAdvertisedDevice& dev) {
-  String raw(dev.getManufacturerData().c_str());
-  if (raw.length() == 0) return String("");
-
-  String best = "";
-  String cur  = "";
-  for (unsigned int i = 0; i < raw.length(); i++) {
-    uint8_t c = (uint8_t)raw[i];
-    /* 允许 ASCII 可见字符与 UTF-8 高位字节，排除控制字符 */
-    if (c >= 0x20 && c != 0x7F) {
-      cur += (char)c;
-    } else {
-      if (cur.length() > best.length() && cur.length() >= 4) best = cur;
-      cur = "";
-    }
-  }
-  if (cur.length() > best.length() && cur.length() >= 4) best = cur;
-  return best;
-}
 /* 3.3.4 的实际签名（编译器报错原文给出）：
  *     virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;
  *
@@ -858,18 +920,6 @@ public:
 
     String nm = String(dev.getName().c_str());
     bool hasName = (nm.length() > 0);
-    bool guessed = false;
-
-    /* 标准 Local Name 没有时，尝试从厂商自定义数据(0xFF)里找名字。
-     * 官方 App 能"扫描阶段就显示名字"，往往就是因为它解析了这一段。 */
-    if (!hasName) {
-      String vn = extractVendorName(dev);
-      if (vn.length() > 0) {
-        nm = vn;
-        hasName = true;
-        guessed = true;
-      }
-    }
 
     String up = nm; up.toUpperCase();
     bool isAnt = hasName && (up.startsWith("ANT") || up.indexOf("ANT") >= 0);
@@ -885,7 +935,6 @@ public:
           gScanList[i].name    = nm;
           gScanList[i].hasName = true;
           gScanList[i].isAnt   = isAnt;
-          gScanList[i].guessed = guessed;
           Serial.printf("[Scan] 补到名字 %s -> %s%s\n",
                         addr.c_str(), nm.c_str(), isAnt ? "  <== ANT" : "");
         }
@@ -900,19 +949,17 @@ public:
     it.rssi    = dev.getRSSI();
     it.isAnt   = isAnt;
     it.hasName = hasName;
-    it.guessed = guessed;
     it.cached  = false;
 
-    Serial.printf("[Scan] %s  %s  rssi=%d%s%s\n",
+    Serial.printf("[Scan] %s  %s  rssi=%d%s\n",
                   addr.c_str(), it.name.c_str(), it.rssi,
-                  guessed ? "  <厂商数据>" : "",
                   isAnt ? "  <== ANT" : "");
   }
 };
 
 /* ============================== 状态 JSON ============================== */
 /* JSON 字符串转义。
- * 必须做：设备名可能来自厂商数据推断，里面可能出现引号、反斜杠、控制字符，
+ * 必须做：设备名可能含引号、反斜杠、控制字符，
  * 直接拼进 JSON 会导致 "Expected ',' or '}' after property value" 这类解析错误。 */
 static String jsonEsc(const String& s) {
   String o;
@@ -950,6 +997,13 @@ String statusJson() {
   s += ",\"txp\":" + String(cfgTxPercent);
   s += ",\"dbm\":\"" + String(percentToDbmText(cfgTxPercent)) + "\"";
   s += ",\"conn\":" + String(getConnCount()) + ",\"connMax\":" + String(MAX_CONN);
+  /* idlePoll=1 表示当前无手机连接，处于低频保活状态（10 秒一次） */
+  s += ",\"idlePoll\":" + String(getConnCount() == 0 ? 1 : 0);
+  s += ",\"dsleep\":" + String(cfgDeepSleep ? 1 : 0);
+  s += ",\"suspended\":" + String(gBmsSuspended ? 1 : 0);
+  s += ",\"ledoff\":" + String(cfgLedOff ? 1 : 0);
+  s += ",\"ledpin\":" + String(cfgLedPin);
+  s += ",\"ledinv\":" + String(cfgLedInvert ? 1 : 0);
   s += ",\"framesIn\":" + String(gFramesFromBms);
   s += ",\"framesOut\":" + String(gFramesToPhone);
   s += ",\"drop\":" + String(gDropBytes);
@@ -1083,7 +1137,6 @@ void handleScan() {
     out += "\"name\":\"" + jsonEsc(gScanList[i].name) + "\",";
     out += "\"rssi\":" + String(gScanList[i].rssi) + ",";
     out += "\"ant\":" + String(gScanList[i].isAnt ? 1 : 0) + ",";
-    out += "\"guess\":" + String(gScanList[i].guessed ? 1 : 0) + ",";
     out += "\"cached\":" + String(gScanList[i].cached ? 1 : 0) + ",";
     out += "\"hasName\":" + String(gScanList[i].hasName ? 1 : 0);
     out += "}";
@@ -1098,7 +1151,52 @@ void handleSave() {
   String relay = server.arg("relay");
   String name  = server.arg("name");
   String txp   = server.arg("txp");
-  mac.trim(); relay.trim(); name.trim(); txp.trim();
+  String dsleep = server.arg("dsleep");
+  mac.trim(); relay.trim(); name.trim(); txp.trim(); dsleep.trim();
+
+  /* 深度休眠开关 */
+  if (dsleep.length() > 0) {
+    bool on = (dsleep == "1");
+    if (on != cfgDeepSleep) {
+      cfgDeepSleep = on;
+      prefs.begin("relay", false);
+      prefs.putBool("dsleep", on);
+      prefs.end();
+      Serial.printf("[Cfg] 深度休眠 %s\n", on ? "开启" : "关闭");
+      if (!on) {
+        gIdleSince = 0;
+        if (gBmsSuspended) bmsResume("用户关闭深度休眠");
+      }
+    }
+  }
+
+  /* LED 控制 */
+  String ledoff = server.arg("ledoff");
+  String ledpin = server.arg("ledpin");
+  String ledinv = server.arg("ledinv");
+  ledoff.trim(); ledpin.trim(); ledinv.trim();
+
+  bool ledChanged = false;
+  if (ledoff.length() > 0) {
+    bool on = (ledoff == "1");
+    if (on != cfgLedOff) { cfgLedOff = on; ledChanged = true; }
+  }
+  if (ledinv.length() > 0) {
+    bool iv = (ledinv == "1");
+    if (iv != cfgLedInvert) { cfgLedInvert = iv; ledChanged = true; }
+  }
+  if (ledpin.length() > 0) {
+    int p = ledpin.toInt();
+    if (p >= 0 && p <= 48 && p != (int)cfgLedPin) { cfgLedPin = (uint8_t)p; ledChanged = true; }
+  }
+  if (ledChanged) {
+    prefs.begin("relay", false);
+    prefs.putBool("ledoff", cfgLedOff);
+    prefs.putBool("ledinv", cfgLedInvert);
+    prefs.putUChar("ledpin", cfgLedPin);
+    prefs.end();
+    applyLedState();
+  }
 
   bool changedMac = (mac.length() == 17 && mac != cfgBmsMac);
 
@@ -1145,6 +1243,8 @@ void handleSave() {
     gAttempt   = 0;
     gConnState = BC_IDLE;
     gNextTryAt = millis() + 300;      /* 300ms 后立即开始连新目标 */
+    gBmsSuspended = false;            /* 换目标时解除深度休眠，否则不会去连 */
+    gIdleSince = 0;
   }
 
   server.send(200, "text/plain; charset=utf-8", "已保存，正在应用配置");
@@ -1277,6 +1377,10 @@ void loadCfg() {
   cfgBmsName   = gBmsCount > 0 ? gBmsList[0].name : String("");
   cfgRelayName = prefs.getString("rname", "ANT-RELAY");
   cfgTxPercent = prefs.getUChar("txp", 80);
+  cfgDeepSleep = prefs.getBool("dsleep", false);
+  cfgLedPin    = prefs.getUChar("ledpin", 48);
+  cfgLedOff    = prefs.getBool("ledoff", false);
+  cfgLedInvert = prefs.getBool("ledinv", false);
   prefs.end();
   if (cfgTxPercent != 20 && cfgTxPercent != 40 && cfgTxPercent != 60 &&
       cfgTxPercent != 80 && cfgTxPercent != 100) {
@@ -1329,6 +1433,9 @@ static uint32_t backoffMs(int attempt) {
 
 /* 主循环里调用，非阻塞推进状态机 */
 void bmsConnTick() {
+  /* 深度休眠期间不做任何重连尝试 */
+  if (gBmsSuspended) return;
+
   /* 已连接：只监控是否还活着 */
   if (bmsConnected) return;
 
@@ -1428,6 +1535,56 @@ void bmsConnTick() {
   gNextTryAt = now + backoffMs(gAttempt);
 }
 
+/* ====================== 深度休眠：挂起 / 唤醒 ====================== */
+void bmsSuspend() {
+  if (gBmsSuspended) return;
+  Serial.println("[Sleep] 空闲超时，断开 BMS 链路以省电");
+  if (bmsClient != nullptr && bmsConnected) bmsClient->disconnect();
+  bmsConnected = false;
+  bmsCh = nullptr;
+  rxlen = 0;
+  gBmsSuspended = true;
+}
+
+void bmsResume(const char* why) {
+  if (!gBmsSuspended) return;
+  Serial.printf("[Sleep] 唤醒（%s），准备重新连接 BMS\n", why);
+  gBmsSuspended = false;
+  gTryIndex  = 0;
+  gAttempt   = 0;
+  gConnState = BC_IDLE;
+  gNextTryAt = millis();          /* 立刻开始连接 */
+}
+
+/* 深度休眠状态机：在主循环里推进 */
+void deepSleepTick() {
+  int phones = getConnCount();
+
+  /* 开关关闭：确保处于唤醒态 */
+  if (!cfgDeepSleep) {
+    gIdleSince = 0;
+    if (gBmsSuspended) bmsResume("深度休眠已关闭");
+    return;
+  }
+
+  if (phones > 0) {
+    gIdleSince = 0;                            /* 有手机，重置空闲计时 */
+    if (gBmsSuspended) bmsResume("检测到手机接入");
+    return;
+  }
+
+  /* 无手机：开始计时 */
+  if (gIdleSince == 0) {
+    gIdleSince = millis();
+    return;
+  }
+  if (gIdleSince == 0xFFFFFFFFUL) gIdleSince = 1;   /* 极小概率的哨兵冲突保护 */
+
+  if (!gBmsSuspended && bmsConnected && (millis() - gIdleSince >= DEEP_IDLE_MS)) {
+    bmsSuspend();
+  }
+}
+
 /* ================================ setup ================================ */
 void setup() {
   Serial.begin(115200);
@@ -1437,6 +1594,7 @@ void setup() {
   pinMode(RELAY_BTN_PIN, INPUT_PULLUP);
 
   loadCfg();
+  applyLedState();        /* 开机就按配置处理板载灯，避免亮到配置完成 */
   initBle();
   initWifi();
 }
@@ -1488,14 +1646,32 @@ void loop() {
     BLEDevice::startAdvertising();
   }
 
-  /* ---- 每秒轮询 BMS ---- */
+  /* ---- 轮询 BMS：按需 + 保活 ----
+   * 没有手机连接时不必要地每秒问一次，白白耗电、也让 BMS 一直应答。
+   * 但**不能完全停**，原因见下面的保活说明。 */
   static uint32_t tPoll = 0;
-  if (millis() - tPoll >= POLL_INTERVAL_MS) {
+  static int lastPhoneCount = -1;
+
+  int phones = getConnCount();
+
+  /* 手机连接数从 0 变成 >0：立刻补一次，让新连上的手机尽快拿到数据。
+     （官方 App 的探测超时约 8 秒，这里必须在 1 秒内给出第一帧） */
+  if (phones > 0 && lastPhoneCount == 0) {
+    gPollNow = true;
+    Serial.println("[Poll] 检测到手机接入，立即请求一次 BMS 数据");
+  }
+  lastPhoneCount = phones;
+
+  /* 有手机：正常 1 Hz；无手机：10 秒一次保活，避免 BMS 因长时间无请求而断开 */
+  uint32_t interval = (phones > 0) ? POLL_INTERVAL_MS : POLL_IDLE_KEEPALIVE_MS;
+  if (gPollNow || (millis() - tPoll >= interval)) {
     tPoll = millis();
+    gPollNow = false;
     pollBms();
   }
 
   /* ---- BMS 连接状态机（无上限重连）---- */
+  deepSleepTick();     /* 先判定是否该休眠/唤醒 */
   bmsConnTick();
 
   delay(2);
