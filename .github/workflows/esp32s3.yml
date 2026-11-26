@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v4
 
     - name: Install Arduino-cli
       run: |
@@ -66,7 +66,7 @@ jobs:
         echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
     - name: Upload files to existing release
-      uses: softprops/action-gh-release@v3
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.get_tag.outputs.tag_name }}
         make_latest: true
