@@ -419,8 +419,43 @@ void applyRelayName(const String& nm) {
 }
 
 /* ============================== WiFi 控制 ============================== */
-String scanJson = "[]";
-volatile bool gScanning = false;
+/* ---------------------- 已保存的 BMS 地址表（LRU，最多 5 台） ---------------------- */
+/* 必须定义在 handleSave / bmsConnTick / loadCfg 之前，否则前向引用编译失败。 */
+static const int CFG_MAX = 5;
+
+struct BmsEntry {
+  String mac;
+  String name;
+};
+
+static BmsEntry gBmsList[CFG_MAX];
+static int      gBmsCount = 0;
+
+void bmsRemember(const String& mac, const String& name);   /* 后置定义 */
+void bmsForget(const String& mac);
+
+/* ---------------------------- 扫描结果存储 ---------------------------- */
+static const int SCAN_MAX = 20;
+
+struct ScanItem {
+  String addr;
+  String name;
+  int    rssi;
+  bool   isAnt;
+  bool   hasName;
+};
+
+static ScanItem gScanList[SCAN_MAX];
+static volatile int gScanCount   = 0;   /* 已记录设备数 */
+static volatile int gScanRawCount = 0;  /* 收到的广播回调总数（含重复） */
+static volatile bool gScanning   = false;
+static volatile bool gScanDone   = true;  /* 扫描是否已结束 */
+
+/* 连接状态机用的全局量（定义在此，供 handleSave 提前引用） */
+static uint32_t gNextTryAt = 0;
+static int      gTryIndex  = 0;
+static int      gAttempt   = 0;
+static int      gConnState = 0;         /* 0=IDLE 1=DIRECT 2=SCANNING */
 
 void handleRoot();
 void handleScan();
@@ -567,15 +602,39 @@ function st(){
  }).catch(()=>{});
 }
 function doScan(){
- var b=document.getElementById('bs'); b.disabled=true; b.textContent='扫描中（约6秒）…';
- document.getElementById('list').textContent='正在扫描…';
+ var b=document.getElementById('bs'); b.disabled=true; b.textContent='扫描中（约8秒）…';
+ document.getElementById('list').textContent='正在扫描，请稍候…';
  fetch('/scan').then(r=>r.json()).then(j=>{
    var L=document.getElementById('list'); L.innerHTML='';
-   if(!j.length){L.textContent='未发现 ANT 设备，请确认 BMS 已上电且在附近';}
-   j.forEach(d=>{
+   if(j.scanning){L.textContent='扫描进行中，请稍后再试';b.disabled=false;b.textContent='重新扫描';return;}
+   var head=document.createElement('div');
+   head.className='mut';
+   head.style.marginBottom='6px';
+   head.innerHTML='收到广播 <b>'+(j.raw||0)+'</b> 次，去重后 <b>'+(j.count||0)+'</b> 台';
+   L.appendChild(head);
+
+   if(!j.list || !j.list.length){
+     L.appendChild(document.createTextNode('没有发现任何蓝牙设备。'));
+     if((j.raw||0)===0){
+       var tip=document.createElement('div');
+       tip.className='mut'; tip.style.marginTop='6px';
+       tip.innerHTML='<b style="color:#dc2626">广播回调为 0</b>：射频未收到任何包。'
+         +'请确认 BMS 已上电、在 10 米内；若 BMS 正被其他主机连接，可能不广播。';
+       L.appendChild(tip);
+     }
+     b.disabled=false; b.textContent='重新扫描';
+     return;
+   }
+
+   var ants=0;
+   j.list.forEach(d=>{
+     if(d.ant) ants++;
      var e=document.createElement('div');
      e.className='dev'+(d.addr==chosen?' sel':'');
-     e.innerHTML='<b>'+d.name+'</b><br><span style="color:#6b7280;font-size:12px">'
+     var tag = d.ant ? '<span style="color:#16a34a;font-weight:600"> [ANT]</span>' : '';
+     var warn = (!d.hasName) ? '<span style="color:#f59e0b"> [无名称]</span>' : '';
+     e.innerHTML='<b>'+d.name+'</b>'+tag+warn
+                 +'<br><span style="color:#6b7280;font-size:12px">'
                  +d.addr+'　RSSI '+d.rssi+'</span>';
      e.onclick=function(){
        chosen=d.addr; chosenName=d.name;
@@ -585,8 +644,19 @@ function doScan(){
      };
      L.appendChild(e);
    });
+
+   var sum=document.createElement('div');
+   sum.className='mut'; sum.style.marginTop='6px';
+   sum.innerHTML = ants>0
+     ? '其中 <b style="color:#16a34a">'+ants+'</b> 台被识别为 ANT（蚂蚁 BMS）。点选后保存即可。'
+     : '未发现名字以 <b>ANT</b> 开头的设备。若你的 BMS 广播名不同，可直接点选对应地址保存。';
+   L.appendChild(sum);
+
    b.disabled=false; b.textContent='重新扫描';
- }).catch(()=>{b.disabled=false;b.textContent='重新扫描';});
+ }).catch(e=>{
+   document.getElementById('list').textContent='扫描请求失败：'+e;
+   b.disabled=false; b.textContent='重新扫描';
+ });
 }
 document.getElementById('txp').addEventListener('change',function(){
   this.dataset.touched='1';
@@ -613,21 +683,48 @@ st(); setInterval(st,2000);
 /* ============================== 扫描回调 ============================== */
 /* 3.3.4 的实际签名（编译器报错原文给出）：
  *     virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;
- * 是**传值**，不是传指针。之前按指针写导致 override 失败、类仍是抽象类。 */
+ *
+ * 设计要点（针对"扫不到任何设备"）：
+ *  1. **不过滤**：所有带地址的广播都记下来，ANT 设备只打个标记。
+ *     之前的实现要求「名字非空 且 以 ANT 开头」，两个条件任一不满足就丢弃，
+ *     结果用户无法区分"没扫到"和"被过滤掉"。
+ *  2. 名字为空的设备也保留（用地址当显示名），并标注 hasName=false，
+ *     因为 BMS 的名字可能只在 scan response 里，时序不对就取不到。
+ *  3. 记录 rawCount（收到的广播总数），前端可据此判断射频是否工作。
+ */
 class ScanCb : public BLEAdvertisedDeviceCallbacks {
 public:
   void onResult(BLEAdvertisedDevice dev) override {
-    if (!gScanning) return;
-    String nm = String(dev.getName().c_str());
-    if (nm.length() == 0) return;
-    String up = nm; up.toUpperCase();
-    if (!up.startsWith("ANT")) return;
+    /* 统计所有回调，无论是否过滤 */
+    gScanRawCount++;
 
-    String item = String("{\"name\":\"") + nm + "\",\"addr\":\"" +
-                  String(dev.getAddress().toString().c_str()) +
-                  "\",\"rssi\":" + String(dev.getRSSI()) + "}";
-    if (scanJson == "[]") scanJson = "[" + item + "]";
-    else                  scanJson = scanJson.substring(0, scanJson.length() - 1) + "," + item + "]";
+    String addr = String(dev.getAddress().toString().c_str());
+    if (addr.length() < 11) return;          /* 地址异常，跳过 */
+
+    /* 去重：同一设备可能被回调多次 */
+    for (int i = 0; i < gScanCount; i++) {
+      if (gScanList[i].addr == addr) {
+        gScanList[i].rssi = dev.getRSSI();   /* 刷新 RSSI */
+        return;
+      }
+    }
+    if (gScanCount >= SCAN_MAX) return;
+
+    String nm = String(dev.getName().c_str());
+    bool hasName = (nm.length() > 0);
+    String up = nm; up.toUpperCase();
+    bool isAnt = hasName && up.startsWith("ANT");
+
+    ScanItem& it = gScanList[gScanCount++];
+    it.addr    = addr;
+    it.name    = hasName ? nm : String("(无名称)");
+    it.rssi    = dev.getRSSI();
+    it.isAnt   = isAnt;
+    it.hasName = hasName;
+
+    Serial.printf("[Scan] %s  %s  rssi=%d%s\n",
+                  addr.c_str(), it.name.c_str(), it.rssi,
+                  isAnt ? "  <== ANT" : "");
   }
 };
 
@@ -668,20 +765,85 @@ void handleRoot() {
 }
 
 void handleScan() {
-  if (gScanning) { server.send(200, "application/json", scanJson); return; }
-  scanJson = "[]";
-  gScanning = true;
+  /* 正在扫描就直接返回“进行中”，不要返回空数组骗前端 */
+  if (gScanning) {
+    server.send(200, "application/json", "{\"scanning\":true}");
+    return;
+  }
+
+  /* 清空上一轮结果 */
+  gScanCount = 0;
+  gScanRawCount = 0;
+
   BLEScan* sc = BLEDevice::getScan();
   sc->setAdvertisedDeviceCallbacks(new ScanCb(), false);
-  sc->setActiveScan(true);
+  sc->setActiveScan(true);        /* 主动扫描，发 SCAN_REQ 索取 scan response 里的名字 */
   sc->setInterval(100);
-  sc->setWindow(99);
-  Serial.println("[Scan] 开始扫描 ANT 设备…");
-  sc->start(6);
+  sc->setWindow(99);              /* 99/100 占空比，尽量不漏包 */
+  sc->setDuplicateFilter(false);  /* 关掉库内去重，否则名字更新收不到 */
+
+  Serial.println("[Scan] 开始扫描 8 秒…");
+  gScanning = true;
+  gScanDone = false;
+
+  /* 【关键】扫描前先停掉自己的广播。
+   * ESP32-S3 只有一个 BLE 控制器：同时"对外广播 + 扫描"时，射频时隙被广播占走，
+   * 扫描窗口被压缩，实测会表现为"一台都扫不到"。停播后扫描占空比才能达到 99%。 */
+  BLEDevice::stopAdvertising();
+  delay(200);
+
+  /* 【关键】若当前正连着 BMS，也要临时断开。
+   * 已建立的 BLE 连接会周期性占用时隙（连接间隔），同样会挤掉扫描窗口。
+   * 扫描完由主循环的 connectBms() 自动重连回去。 */
+  bool wasConnected = bmsConnected;
+  if (wasConnected) {
+    Serial.println("[Scan] 临时断开 BMS 以释放射频…");
+    if (bmsClient != nullptr) bmsClient->disconnect();
+    bmsConnected = false;
+    bmsCh = nullptr;
+    delay(300);
+  }
+
+  /* 阻塞扫描 8 秒：期间 loop() 不跑，Web 请求会排队。
+     代价是扫描时页面短暂无响应，换来的是结果确定、无并发问题。 */
+  sc->start(8, false);
+  while (sc->isScanning()) {
+    delay(50);
+  }
+  sc->stop();
   sc->clearResults();
+
+  /* 扫描结束，恢复广播（手机才能重新看到中继） */
+  BLEDevice::startAdvertising();
+  if (wasConnected) {
+    Serial.println("[Scan] 扫描结束，BMS 将由主循环自动重连");
+  }
+
   gScanning = false;
-  Serial.printf("[Scan] 结束，JSON 长度 %d\n", scanJson.length());
-  server.send(200, "application/json", scanJson);
+  gScanDone = true;
+
+  Serial.printf("[Scan] 结束：广播回调 %d 次，去重后 %d 台\n",
+                gScanRawCount, gScanCount);
+
+  /* 手工拼 JSON，避免 String 反复 substring 出错 */
+  String out = "{";
+  out += "\"scanning\":false,";
+  out += "\"raw\":" + String(gScanRawCount) + ",";
+  out += "\"count\":" + String(gScanCount) + ",";
+  out += "\"list\":[";
+  for (int i = 0; i < gScanCount; i++) {
+    if (i) out += ",";
+    out += "{";
+    out += "\"addr\":\"" + gScanList[i].addr + "\",";
+    out += "\"name\":\"" + gScanList[i].name + "\",";
+    out += "\"rssi\":" + String(gScanList[i].rssi) + ",";
+    out += "\"ant\":" + String(gScanList[i].isAnt ? 1 : 0) + ",";
+    out += "\"hasName\":" + String(gScanList[i].hasName ? 1 : 0);
+    out += "}";
+  }
+  out += "]}";
+
+  server.send(200, "application/json", out);
 }
 
 void handleSave() {
@@ -692,13 +854,12 @@ void handleSave() {
   mac.trim(); relay.trim(); name.trim(); txp.trim();
 
   bool changedMac = (mac.length() == 17 && mac != cfgBmsMac);
+
+  /* 记住这台 BMS（写表头 + 落盘），并设为当前目标 */
   if (mac.length() == 17) {
-    prefs.putString("mac", mac);
-    cfgBmsMac = mac;
-  }
-  if (name.length() > 0) {
-    prefs.putString("bname", name);
-    cfgBmsName = name;
+    bmsRemember(mac, name);
+    cfgBmsMac  = mac;
+    cfgBmsName = (name.length() > 0) ? name : String("BMS");
   }
 
   if (relay.length() >= 3 && relay != cfgRelayName) {
@@ -706,16 +867,19 @@ void handleSave() {
     if (!up.startsWith("ANT")) {
       Serial.println("[Cfg] 警告：中继名未以 ANT 开头，官方 App 可能识别不到");
     }
+    prefs.begin("relay", false);
     prefs.putString("rname", relay);
+    prefs.end();
     applyRelayName(relay);
   }
 
   if (txp.length() > 0) {
     int p = txp.toInt();
     if (p > 0 && p <= 100) {
+      prefs.begin("relay", false);
       prefs.putUChar("txp", (uint8_t)p);
+      prefs.end();
       applyTxPower((uint8_t)p);
-      /* 广播包功率改动需重启广播才在部分版本生效 */
       if (bleInited) {
         BLEDevice::stopAdvertising();
         delay(80);
@@ -725,11 +889,17 @@ void handleSave() {
   }
 
   if (changedMac) {
+    /* 换目标：断开当前连接，让状态机立即重新开始 */
     if (bmsClient != nullptr && bmsConnected) bmsClient->disconnect();
     bmsConnected = false;
     bmsCh = nullptr;
     rxlen = 0;
+    gTryIndex  = 0;
+    gAttempt   = 0;
+    gConnState = BC_IDLE;
+    gNextTryAt = millis() + 300;      /* 300ms 后立即开始连新目标 */
   }
+
   server.send(200, "text/plain; charset=utf-8", "已保存，正在应用配置");
 }
 
@@ -770,10 +940,77 @@ void initWifi() {
 }
 
 /* ================================ 配置 ================================ */
+/* BMS 地址表结构体与 gBmsList/gBmsCount 已在前方定义（供 handleSave 提前引用）。
+ * 这里只放实现。 */
+
+/* 把一台设备写入表头（已存在则提到最前），并落盘 */
+void bmsRemember(const String& mac, const String& name) {
+  if (mac.length() != 17) return;
+  /* 先移除同地址旧项 */
+  for (int i = 0; i < gBmsCount; i++) {
+    if (gBmsList[i].mac == mac) {
+      for (int j = i; j < gBmsCount - 1; j++) gBmsList[j] = gBmsList[j + 1];
+      gBmsCount--;
+      break;
+    }
+  }
+  /* 插到最前（若已满，丢掉最后一个） */
+  int n = (gBmsCount < CFG_MAX) ? gBmsCount : CFG_MAX - 1;
+  for (int j = n; j > 0; j--) gBmsList[j] = gBmsList[j - 1];
+  gBmsList[0].mac  = mac;
+  gBmsList[0].name = (name.length() > 0) ? name : String("BMS");
+  gBmsCount = n + 1;
+
+  /* 持久化：mac0/name0 是最新，依次写入 */
+  prefs.begin("relay", false);
+  for (int i = 0; i < CFG_MAX; i++) {
+    if (i < gBmsCount) {
+      prefs.putString(("m" + String(i)).c_str(), gBmsList[i].mac);
+      prefs.putString(("n" + String(i)).c_str(), gBmsList[i].name);
+    } else {
+      prefs.remove(("m" + String(i)).c_str());
+      prefs.remove(("n" + String(i)).c_str());
+    }
+  }
+  prefs.end();
+  Serial.printf("[Cfg] 已记住 %s (%s)，表内 %d 台\n", mac.c_str(), name.c_str(), gBmsCount);
+}
+
+void bmsForget(const String& mac) {
+  for (int i = 0; i < gBmsCount; i++) {
+    if (gBmsList[i].mac == mac) {
+      for (int j = i; j < gBmsCount - 1; j++) gBmsList[j] = gBmsList[j + 1];
+      gBmsCount--;
+      break;
+    }
+  }
+  prefs.begin("relay", false);
+  for (int i = 0; i < CFG_MAX; i++) {
+    if (i < gBmsCount) {
+      prefs.putString(("m" + String(i)).c_str(), gBmsList[i].mac);
+      prefs.putString(("n" + String(i)).c_str(), gBmsList[i].name);
+    } else {
+      prefs.remove(("m" + String(i)).c_str());
+      prefs.remove(("n" + String(i)).c_str());
+    }
+  }
+  prefs.end();
+}
+
 void loadCfg() {
   prefs.begin("relay", false);
-  cfgBmsMac    = prefs.getString("mac", "");
-  cfgBmsName   = prefs.getString("bname", "");
+  gBmsCount = 0;
+  for (int i = 0; i < CFG_MAX; i++) {
+    String m = prefs.getString(("m" + String(i)).c_str(), "");
+    String n = prefs.getString(("n" + String(i)).c_str(), "");
+    if (m.length() == 17) {
+      gBmsList[gBmsCount].mac  = m;
+      gBmsList[gBmsCount].name = n;
+      gBmsCount++;
+    }
+  }
+  cfgBmsMac    = gBmsCount > 0 ? gBmsList[0].mac : String("");
+  cfgBmsName   = gBmsCount > 0 ? gBmsList[0].name : String("");
   cfgRelayName = prefs.getString("rname", "ANT-RELAY");
   cfgTxPercent = prefs.getUChar("txp", 80);
   prefs.end();
@@ -781,8 +1018,154 @@ void loadCfg() {
       cfgTxPercent != 80 && cfgTxPercent != 100) {
     cfgTxPercent = 80;
   }
-  Serial.printf("[Cfg] BMS=%s Relay=%s Power=%u%%\n",
-                cfgBmsMac.c_str(), cfgRelayName.c_str(), (unsigned)cfgTxPercent);
+  Serial.printf("[Cfg] 记忆 %d 台 BMS，首选=%s  Relay=%s  Power=%u%%\n",
+                gBmsCount, cfgBmsMac.c_str(), cfgRelayName.c_str(),
+                (unsigned)cfgTxPercent);
+  for (int i = 0; i < gBmsCount; i++) {
+    Serial.printf("      [%d] %s  %s\n", i, gBmsList[i].mac.c_str(),
+                  gBmsList[i].name.c_str());
+  }
+}
+
+/* ====================== BMS 自动连接状态机（无上限重连） ====================== */
+/*
+ * 状态：
+ *   IDLE    —— 刚启动/刚断开，等待退避后开始一轮尝试
+ *   DIRECT  —— 按保存的地址表逐一直连
+ *   SCANNING—— 直连全失败，开扫描找表内地址（8 秒一轮，循环不停）
+ *
+ * 行为保证（对应需求）：
+ *   1. 记住连过的地址（最多 5 台，LRU），开机自动尝试
+ *   2. 连不上就一直循环重试，**不设次数上限**，不进入永久放弃状态
+ *   3. 已连上后断开，自动回到 IDLE 重新连接
+ */
+/* 状态机全局量（gConnState/gNextTryAt/gTryIndex/gAttempt）已在前方定义，
+ * 这里只写逻辑。状态取值：0=IDLE 1=DIRECT 2=SCANNING */
+
+static uint32_t gConnOkAt = 0;      /* 连上时刻，用于判断"连上就断" */
+static int      gScanHits = 0;      /* 扫描轮次计数，仅日志用 */
+
+#define BC_IDLE      0
+#define BC_DIRECT    1
+#define BC_SCANNING  2
+
+/* 连接成功后调用：更新 LRU、复位退避 */
+static void onBmsConnected(const String& mac, const String& name) {
+  bmsRemember(mac, name);                /* 提到表头并落盘 */
+  cfgBmsMac  = mac;
+  cfgBmsName = name;
+  gConnOkAt  = millis();
+  gAttempt   = 0;
+  gTryIndex  = 0;
+  gConnState = BC_IDLE;                  /* 已连上，状态机暂停在 IDLE */
+  Serial.printf("[Conn] 已连接 %s (%s)\n", mac.c_str(), name.c_str());
+}
+
+/* 指数退避：1s,2s,4s,8s,15s 封顶。永不放弃。 */
+static uint32_t backoffMs(int attempt) {
+  uint32_t ms = 1000UL << (attempt > 4 ? 4 : attempt);
+  return ms > 15000UL ? 15000UL : ms;
+}
+
+/* 主循环里调用，非阻塞推进状态机 */
+void bmsConnTick() {
+  /* 已连接：只监控是否还活着 */
+  if (bmsConnected) return;
+
+  uint32_t now = millis();
+
+  /* 扫描进行中（配置页触发的扫描），让路 */
+  if (gScanning) return;
+
+  /* 还没到重试时刻 */
+  if ((int32_t)(now - gNextTryAt) < 0) return;
+
+  /* ---- 1. 先按保存的地址表顺序直连 ---- */
+  if (gBmsCount > 0 && gTryIndex < gBmsCount) {
+    const String mac  = gBmsList[gTryIndex].mac;
+    const String name = gBmsList[gTryIndex].name;
+    Serial.printf("[Conn] 直连尝试 %d/%d：%s (%s)\n",
+                  gTryIndex + 1, gBmsCount, mac.c_str(), name.c_str());
+
+    String savedMac = cfgBmsMac;
+    cfgBmsMac = mac;                     /* connectBms 读 cfgBmsMac */
+    bool ok = connectBms();
+    cfgBmsMac = savedMac;
+
+    if (ok) {
+      onBmsConnected(mac, name);
+      return;
+    }
+    gTryIndex++;
+    gNextTryAt = now + 800;              /* 下一台稍等一下再试 */
+    return;
+  }
+
+  /* ---- 2. 地址表都试过了，进入扫描模式 ---- */
+  if (gConnState != BC_SCANNING) {
+    gConnState = BC_SCANNING;
+    gScanHits  = 0;
+    gAttempt++;
+    uint32_t wait = backoffMs(gAttempt);
+    gNextTryAt = now + wait;
+    Serial.printf("[Conn] 直连全部失败，%u ms 后开始扫描（第 %d 轮）\n",
+                  (unsigned)wait, gAttempt);
+    return;
+  }
+
+  /* ---- 3. 扫描一轮，找表内地址 ---- */
+  gScanHits++;
+  Serial.printf("[Conn] 扫描第 %d 轮，寻找已保存的 BMS…\n", gScanHits);
+
+  /* 扫描会占用射频，需先停播（与 handleScan 同理） */
+  BLEDevice::stopAdvertising();
+  delay(100);
+
+  gScanCount = 0;
+  gScanRawCount = 0;
+  BLEScan* sc = BLEDevice::getScan();
+  sc->setAdvertisedDeviceCallbacks(new ScanCb(), false);
+  sc->setActiveScan(true);
+  sc->setInterval(100);
+  sc->setWindow(99);
+  sc->setDuplicateFilter(false);
+  sc->start(4, false);                   /* 自动重连用 4 秒短扫，避免拖太久 */
+  uint32_t t0 = millis();
+  while (sc->isScanning() && millis() - t0 < 6000) delay(30);
+  sc->stop();
+  sc->clearResults();
+  BLEDevice::startAdvertising();
+
+  /* 在扫到的设备里找表内地址 */
+  int hit = -1;
+  for (int i = 0; i < gScanCount; i++) {
+    for (int k = 0; k < gBmsCount; k++) {
+      if (gScanList[i].addr == gBmsList[k].mac) { hit = k; break; }
+    }
+    if (hit >= 0) break;
+  }
+
+  if (hit >= 0) {
+    const String mac  = gBmsList[hit].mac;
+    const String name = gBmsList[hit].name;
+    Serial.printf("[Conn] 扫描到目标 %s，立即连接\n", mac.c_str());
+    String savedMac = cfgBmsMac;
+    cfgBmsMac = mac;
+    bool ok = connectBms();
+    cfgBmsMac = savedMac;
+    if (ok) { onBmsConnected(mac, name); return; }
+  } else {
+    Serial.printf("[Conn] 本轮未扫到目标（扫到 %d 台设备）\n", gScanCount);
+  }
+
+  /* 无论是否扫到，都从表头重新开始直连，形成无限循环 */
+  gTryIndex = 0;
+  if (gScanHits >= 3) {                  /* 连续 3 轮扫描无果后加大间隔 */
+    gAttempt++;
+    gScanHits = 0;
+  }
+  gConnState = BC_IDLE;
+  gNextTryAt = now + backoffMs(gAttempt);
 }
 
 /* ================================ setup ================================ */
@@ -852,14 +1235,8 @@ void loop() {
     pollBms();
   }
 
-  /* ---- BMS 掉线重连 ---- */
-  static uint32_t tReconn = 0;
-  if (!bmsConnected && cfgBmsMac.length() == 17 && !gScanning) {
-    if (millis() - tReconn >= 5000) {
-      tReconn = millis();
-      connectBms();
-    }
-  }
+  /* ---- BMS 连接状态机（无上限重连）---- */
+  bmsConnTick();
 
   delay(2);
 }
