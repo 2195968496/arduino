@@ -40,12 +40,16 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-/* 说明：不需要单独 #include <esp_bt.h> / <esp_gap_ble_api.h> / <esp_gatts_api.h>。
- * 这三个是 ESP-IDF 的底层头文件，不是 Arduino 库；而 BLEDevice.h 内部已经
- * 包含了它们（esp_bt.h、esp_gap_ble_api.h、esp_gatts_api.h），
- * 所以 esp_power_level_t / ESP_PWR_LVL_* / esp_ble_tx_power_set /
- * esp_gatt_if_t / esp_ble_gatts_send_indicate 这些符号都已可见。
- * 在本文件里重复 include 反而会因为不同 core 版本的搜索路径差异报 file not found。 */
+/* esp32 core 3.3.4（官方完整版）的 include 路径是完整的，
+ * 显式包含底层头文件可避免依赖 BLEDevice.h 的传递包含，更稳妥。
+ * 用到的符号来源：
+ *   esp_power_level_t / ESP_PWR_LVL_* / esp_ble_tx_power_set  → esp_bt.h
+ *   esp_ble_gap_set_device_name                              → esp_gap_ble_api.h
+ *   esp_ble_gatts_send_indicate / esp_gatt_if_t               → esp_gatts_api.h
+ */
+#include <esp_bt.h>
+#include <esp_gap_ble_api.h>
+#include <esp_gatts_api.h>
 
 /* ------------------------------ 可改配置 ------------------------------ */
 static const char* AP_SSID = "Ant-Bms";
@@ -194,7 +198,18 @@ void applyTxPower(uint8_t pct) {
 
 
 /* ========================= 向上（手机）转发 ========================= */
-
+/*
+ * 3.3.4 的 BLECharacteristic 只有：
+ *     void notify(bool is_notification = true);
+ *     void indicate();
+ * 没有「指定 conn_id」的重载（notify(data, len, connId) 在 3.3.4 不存在）。
+ *
+ * 所以多设备发送走 IDF 底层 esp_ble_gatts_send_indicate()。
+ * 3.3.4 的 BLEDevice.h → BLEServer.h → esp_gatts_api.h 已完整引入该符号，
+ * 无需自声明（自声明反而可能与头文件原型冲突）。
+ *
+ * gatts_if 从 BLEServer::getGattsIf() 取 —— 3.x 是 public，可直接用。
+ */
 void notifyToPhones(const uint8_t* data, size_t len) {
   if (pTxCh == nullptr || pServer == nullptr) return;
 
@@ -202,19 +217,21 @@ void notifyToPhones(const uint8_t* data, size_t len) {
   int n = snapshotConns(ids);
   if (n == 0) return;                  /* 无手机连接，不必组包 */
 
+  uint16_t handle = pTxCh->getHandle();
+  esp_gatt_if_t gattsIf = pServer->getGattsIf();
+
   for (size_t off = 0; off < len; off += NOTIFY_CHUNK) {
     size_t c = len - off;
     if (c > NOTIFY_CHUNK) c = NOTIFY_CHUNK;
 
     for (int i = 0; i < n; i++) {
-      // 3.x 核心中，直接调用 BLECharacteristic 的 notify 函数，
-      // 传入 conn_id 即可自动定向发给指定的那一台手机
-      pTxCh->notify((uint8_t*)(data + off), c, ids[i]);
+      esp_ble_gatts_send_indicate(gattsIf, ids[i], handle,
+                                  (uint16_t)c, (uint8_t*)(data + off), false);
     }
     /* 给协议栈留出排空时间，否则发送队列溢出导致丢包 */
     delay(6);
   }
-}}
+}
 /* ======================= 从 BMS 收到的字节流重组 ======================= */
 static uint8_t rxbuf[1024];
 static size_t  rxlen = 0;
@@ -411,10 +428,6 @@ void initBle() {
   pTxCh->addDescriptor(new BLE2902());
   svc->start();
 
-  /* 注册 GATTS 回调，从 ESP_GATTS_REG_EVT 里抓 gatts_if
-   * （不依赖 BLEServer::getGattsIf，那个在某些 core 未公开）*/
- //esp_ble_gatts_register_callback(relayGattsRegCb);
-
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
@@ -427,18 +440,20 @@ void initBle() {
   Serial.printf("[BLE] 广播名 = %s\n", cfgRelayName.c_str());
 }
 
+/* 运行时改广播名。
+ * 3.3.4 的 BLEDevice 没有 setDeviceName()（那是别的框架/别的版本才有的）。
+ * 3.3.4 里改设备名要用 IDF 的 esp_ble_gap_set_device_name()，
+ * 它在 3.3.4 的 BLEDevice.h 链路里已声明，可直接调用。
+ * 改名后必须重新 startAdvertising 才能让新名字出现在广播包里。 */
 void applyRelayName(const String& nm) {
   cfgRelayName = nm;
   BLEDevice::stopAdvertising();
   delay(120);
-  
-  // 3.x 核心中，直接使用 BLEDevice 的 setDeviceName 接口
-  BLEDevice::setDeviceName(nm.c_str());
-  
+  esp_ble_gap_set_device_name(nm.c_str());
   delay(120);
   BLEDevice::startAdvertising();
   Serial.printf("[BLE] 广播名已改为 %s\n", cfgRelayName.c_str());
-}}
+}
 
 /* ============================== WiFi 控制 ============================== */
 String scanJson = "[]";
@@ -633,21 +648,14 @@ st(); setInterval(st,2000);
 </script></body></html>)HTML";
 
 /* ============================== 扫描回调 ============================== */
-/* onResult 的虚函数签名在不同 core 里不一致（传值 / 传指针），而且
- * 具体是哪种无法靠版本宏判断（遇到过 3.x 版本号却仍用传值的构建）。
- *
- * 解决办法：两个重载都不写 override 关键字，都提供。
- *   - 编译器会自动把与基类虚函数匹配的那个识别为覆写；
- *   - 另一个只是普通的额外重载，不影响；
- *   - 这样无论基类是传值还是传指针，本类都不是抽象类，可正常 new。
- */
+/* esp32 core 3.x 的 BLEAdvertisedDeviceCallbacks::onResult 签名是
+ *     void onResult(BLEAdvertisedDevice* dev)
+ * 传指针。3.3.4 若写成传值重载会触发 -Woverloaded-virtual 并导致该类
+ * 仍是抽象类。所以这里严格按 3.x 签名写，并加 override 让编译器校验。 */
 class ScanCb : public BLEAdvertisedDeviceCallbacks {
 public:
-  void onResult(BLEAdvertisedDevice dev) { handleDev(&dev); }
-  void onResult(BLEAdvertisedDevice* dev) { if (dev) handleDev(dev); }
-
-  void handleDev(BLEAdvertisedDevice* dev) {
-    if (!gScanning) return;
+  void onResult(BLEAdvertisedDevice* dev) override {
+    if (!dev || !gScanning) return;
     String nm = String(dev->getName().c_str());
     if (nm.length() == 0) return;
     String up = nm; up.toUpperCase();
