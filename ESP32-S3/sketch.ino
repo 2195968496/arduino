@@ -451,17 +451,26 @@ static volatile int gScanRawCount = 0;  /* 收到的广播回调总数（含重�
 static volatile bool gScanning   = false;
 static volatile bool gScanDone   = true;  /* 扫描是否已结束 */
 
+/* 连接状态机状态常量。
+ * 必须用 #define 且放在最前面：handleSave() 在 bmsConnTick() 之前就引用了
+ * BC_IDLE，宏没有「前向声明」这回事，定义晚于使用就会报
+ * "'BC_IDLE' was not declared in this scope"。 */
+#define BC_IDLE      0
+#define BC_DIRECT    1
+#define BC_SCANNING  2
+
 /* 连接状态机用的全局量（定义在此，供 handleSave 提前引用） */
 static uint32_t gNextTryAt = 0;
 static int      gTryIndex  = 0;
 static int      gAttempt   = 0;
-static int      gConnState = 0;         /* 0=IDLE 1=DIRECT 2=SCANNING */
+static int      gConnState = BC_IDLE;
 
 void handleRoot();
 void handleScan();
 void handleSave();
 void handleStatus();
 void handleWifiCtl();
+void bmsConnTick();                /* 状态机在文件后部定义，loop() 里调用 */
 
 /* 路由只在 setup 里注册一次；wifiStart/wifiStop 只管 socket 与射频 */
 bool routesRegistered = false;
@@ -1039,15 +1048,11 @@ void loadCfg() {
  *   2. 连不上就一直循环重试，**不设次数上限**，不进入永久放弃状态
  *   3. 已连上后断开，自动回到 IDLE 重新连接
  */
-/* 状态机全局量（gConnState/gNextTryAt/gTryIndex/gAttempt）已在前方定义，
- * 这里只写逻辑。状态取值：0=IDLE 1=DIRECT 2=SCANNING */
+/* 状态机全局量（gConnState/gNextTryAt/gTryIndex/gAttempt）与
+ * BC_IDLE/BC_DIRECT/BC_SCANNING 均已在文件前部定义，这里只写逻辑。 */
 
 static uint32_t gConnOkAt = 0;      /* 连上时刻，用于判断"连上就断" */
 static int      gScanHits = 0;      /* 扫描轮次计数，仅日志用 */
-
-#define BC_IDLE      0
-#define BC_DIRECT    1
-#define BC_SCANNING  2
 
 /* 连接成功后调用：更新 LRU、复位退避 */
 static void onBmsConnected(const String& mac, const String& name) {
@@ -1239,4 +1244,5 @@ void loop() {
   bmsConnTick();
 
   delay(2);
+}
 }
