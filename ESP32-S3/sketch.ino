@@ -194,12 +194,9 @@ void applyTxPower(uint8_t pct) {
 
 
 /* ========================= 向上（手机）转发 ========================= */
+
 void notifyToPhones(const uint8_t* data, size_t len) {
   if (pTxCh == nullptr || pServer == nullptr) return;
-
-  // 3.x 核心中直接获取 GATTS 接口号
-  esp_gatt_if_t gGattsIf = pServer->getGattsIf();
-  uint16_t handle = pTxCh->getHandle();
 
   uint16_t ids[MAX_CONN];
   int n = snapshotConns(ids);
@@ -210,12 +207,14 @@ void notifyToPhones(const uint8_t* data, size_t len) {
     if (c > NOTIFY_CHUNK) c = NOTIFY_CHUNK;
 
     for (int i = 0; i < n; i++) {
-      esp_ble_gatts_send_indicate(gGattsIf, ids[i], handle, (uint16_t)c,
-                                  (uint8_t*)(data + off), false);
+      // 3.x 核心中，直接调用 BLECharacteristic 的 notify 函数，
+      // 传入 conn_id 即可自动定向发给指定的那一台手机
+      pTxCh->notify((uint8_t*)(data + off), c, ids[i]);
     }
+    /* 给协议栈留出排空时间，否则发送队列溢出导致丢包 */
     delay(6);
   }
-}
+}}
 /* ======================= 从 BMS 收到的字节流重组 ======================= */
 static uint8_t rxbuf[1024];
 static size_t  rxlen = 0;
@@ -427,18 +426,19 @@ void initBle() {
 
   Serial.printf("[BLE] 广播名 = %s\n", cfgRelayName.c_str());
 }
+
 void applyRelayName(const String& nm) {
   cfgRelayName = nm;
   BLEDevice::stopAdvertising();
   delay(120);
   
-  // 直接调用官方底层接口修改蓝牙名称
-  esp_ble_gap_set_device_name(nm.c_str());
+  // 3.x 核心中，直接使用 BLEDevice 的 setDeviceName 接口
+  BLEDevice::setDeviceName(nm.c_str());
   
   delay(120);
   BLEDevice::startAdvertising();
   Serial.printf("[BLE] 广播名已改为 %s\n", cfgRelayName.c_str());
-}
+}}
 
 /* ============================== WiFi 控制 ============================== */
 String scanJson = "[]";
