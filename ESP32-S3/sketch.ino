@@ -911,6 +911,26 @@ public:
 };
 
 /* ============================== 状态 JSON ============================== */
+/* JSON 字符串转义。
+ * 必须做：设备名可能来自厂商数据推断，里面可能出现引号、反斜杠、控制字符，
+ * 直接拼进 JSON 会导致 "Expected ',' or '}' after property value" 这类解析错误。 */
+static String jsonEsc(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') {
+      o += '\\';
+      o += c;
+    } else if ((uint8_t)c < 0x20) {
+      o += ' ';               /* 控制字符直接换成空格，避免破坏结构 */
+    } else {
+      o += c;
+    }
+  }
+  return o;
+}
+
 uint32_t wifiLeftSec() {
   if (!wifiOn) return 0;
   if (WiFi.softAPgetStationNum() > 0) return WIFI_IDLE_MS / 1000;
@@ -923,10 +943,10 @@ uint32_t wifiLeftSec() {
 String statusJson() {
   String s = "{";
   s += "\"bmsConnected\":" + String(bmsConnected ? 1 : 0);
-  s += ",\"bms\":\"" + cfgBmsName + " " + cfgBmsMac + "\"";
-  s += ",\"bmsName\":\"" + cfgBmsName + "\"";
-  s += ",\"mac\":\"" + cfgBmsMac + "\"";
-  s += ",\"relay\":\"" + cfgRelayName + "\"";
+  s += ",\"bms\":\"" + jsonEsc(cfgBmsName + " " + cfgBmsMac) + "\"";
+  s += ",\"bmsName\":\"" + jsonEsc(cfgBmsName) + "\"";
+  s += ",\"mac\":\"" + jsonEsc(cfgBmsMac) + "\"";
+  s += ",\"relay\":\"" + jsonEsc(cfgRelayName) + "\"";
   s += ",\"txp\":" + String(cfgTxPercent);
   s += ",\"dbm\":\"" + String(percentToDbmText(cfgTxPercent)) + "\"";
   s += ",\"conn\":" + String(getConnCount()) + ",\"connMax\":" + String(MAX_CONN);
@@ -1059,8 +1079,8 @@ void handleScan() {
   for (int i = 0; i < gScanCount; i++) {
     if (i) out += ",";
     out += "{";
-    out += "\"addr\":\"" + gScanList[i].addr + "\",";
-    out += "\"name\":\"" + gScanList[i].name + "\",";
+    out += "\"addr\":\"" + jsonEsc(gScanList[i].addr) + "\",";
+    out += "\"name\":\"" + jsonEsc(gScanList[i].name) + "\",";
     out += "\"rssi\":" + String(gScanList[i].rssi) + ",";
     out += "\"ant\":" + String(gScanList[i].isAnt ? 1 : 0) + ",";
     out += "\"guess\":" + String(gScanList[i].guessed ? 1 : 0) + ",";
@@ -1142,8 +1162,8 @@ void handleReadName() {
 
   String out = "{";
   out += "\"ok\":" + String(ok ? 1 : 0);
-  out += ",\"name\":\"" + nm + "\"";
-  out += ",\"err\":\"" + err + "\"";
+  out += ",\"name\":\"" + jsonEsc(nm) + "\"";
+  out += ",\"err\":\"" + jsonEsc(err) + "\"";
   out += "}";
   server.send(200, "application/json", out);
 }
