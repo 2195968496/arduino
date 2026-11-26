@@ -1,4 +1,4 @@
-#
+/*
  * ============================================================================
  *  BMS 蓝牙中继固件  (ESP32-S3 / Arduino-ESP32)
  * ============================================================================
@@ -167,18 +167,12 @@ size_t buildShortFrame(uint8_t* out, uint8_t addr, uint8_t fc,
 }
 
 /* ========================= 发射功率（5 档） ========================= */
-/* 百分比 -> dBm 档位数值。
- * ESP32-S3 支持 -12/-9/-6/-3/0/+3/+6/+9 dBm，IDF 里用 esp_power_level_t 枚举表示，
- * 但极简 core 里这个类型/常量可能没暴露。这里直接用底层整数值：
- *   -6dBm = 4, 0dBm = 7, +3dBm = 8, +6dBm = 9, +9dBm = 10
- * （顺序对应 ESP_PWR_LVL_N12=0 … ESP_PWR_LVL_P9=10）
- * 若你的 core 有完整枚举，用常量名同样得到这些值。 */
-static int percentToPwrLevelInt(uint8_t pct) {
-  if (pct <= 20) return 4;   /* -6 dBm */
-  if (pct <= 40) return 7;   /*  0 dBm */
-  if (pct <= 60) return 8;   /* +3 dBm */
-  if (pct <= 80) return 9;   /* +6 dBm */
-  return 10;                 /* +9 dBm */
+static esp_power_level_t percentToPwrLevel(uint8_t pct) {
+  if (pct <= 20) return ESP_PWR_LVL_N6;   /* -6 dBm */
+  if (pct <= 40) return ESP_PWR_LVL_N0;   /*  0 dBm */
+  if (pct <= 60) return ESP_PWR_LVL_P3;   /* +3 dBm */
+  if (pct <= 80) return ESP_PWR_LVL_P6;   /* +6 dBm */
+  return ESP_PWR_LVL_P9;                  /* +9 dBm */
 }
 
 static const char* percentToDbmText(uint8_t pct) {
@@ -189,69 +183,23 @@ static const char* percentToDbmText(uint8_t pct) {
   return "+9 dBm";
 }
 
-/* esp_ble_tx_power_set 也可能未声明，自声明原型（参数用 int 避免枚举依赖）*/
-extern "C" esp_err_t esp_ble_tx_power_set(int type, int power_level);
-
 void applyTxPower(uint8_t pct) {
-  int lv = percentToPwrLevelInt(pct);
-  esp_ble_tx_power_set(0, lv);      /* 0 = ESP_BLE_PWR_TYPE_ADV   广播包 */
-  esp_ble_tx_power_set(1, lv);      /* 1 = ESP_BLE_PWR_TYPE_DEFAULT 连接 */
-  esp_ble_tx_power_set(2, lv);      /* 2 = ESP_BLE_PWR_TYPE_SCAN    扫描 */
+  esp_power_level_t lv = percentToPwrLevel(pct);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, lv);      /* 广播包 */
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, lv);  /* 连接 */
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, lv);     /* 扫描 */
   cfgTxPercent = pct;
   Serial.printf("[PWR] 发射功率 %u%% (%s)\n", (unsigned)pct, percentToDbmText(pct));
 }
 
+
 /* ========================= 向上（手机）转发 ========================= */
-/* 本文件用到的 IDF 符号在这个 core 里没有声明，这里做兼容处理。
- *
- * RELAY_MULTI_CONN = 1 : 用 IDF 底层接口逐连接发送，支持 3 台同时收
- * RELAY_MULTI_CONN = 0 : 退回 Arduino 原生 notify()，只支持单台
- *
- * 如果编译期报 esp_gatt_if_t 之类类型不存在，或链接期报 undefined reference，
- * 就把这里改成 0 —— 功能降级为单设备，但一定能编过。
- */
-#define RELAY_MULTI_CONN 1
-
-#if RELAY_MULTI_CONN
-/* 自声明原型，避免 undeclared identifier。
- * 参数一律用基础整数类型，彻底避开对 IDF 枚举/结构体类型的依赖。 */
-extern "C" {
-esp_err_t esp_ble_gatts_send_indicate(uint8_t gatts_if,
-                                      uint16_t conn_id,
-                                      uint16_t attr_handle,
-                                      uint16_t value_len,
-                                      uint8_t *value,
-                                      bool need_confirm);
-esp_err_t esp_ble_gatts_register_callback(void (*callback)(int event,
-                                                           uint8_t gatts_if,
-                                                           void* param));
-}
-#endif
-
-/* GATTS 接口号：用 uint8_t，避免依赖 esp_gatt_if_t */
-static uint8_t gGattsIf = 0;
-static bool gGattsIfReady = false;
-
-/* 直接挂一次 GATTS 注册回调，从 ESP_GATTS_REG_EVT 里取 gatts_if。
- * ESP_GATTS_REG_EVT 的枚举值是 0，用数字避免依赖枚举类型。 */
-static void relayGattsRegCb(int event, uint8_t gatts_if, void* param) {
-  (void)param;
-  if (event == 0) {                    /* ESP_GATTS_REG_EVT == 0 */
-    gGattsIf = gatts_if;
-    gGattsIfReady = true;
-    Serial.printf("[BLE] GATTS 接口号 = %u\n", (unsigned)gatts_if);
-  }
-}
-
 void notifyToPhones(const uint8_t* data, size_t len) {
   if (pTxCh == nullptr || pServer == nullptr) return;
 
-#if RELAY_MULTI_CONN
-  if (!gGattsIfReady) return;          /* 接口号还没抓到就先不发 */
+  // 3.x 核心中直接获取 GATTS 接口号
+  esp_gatt_if_t gGattsIf = pServer->getGattsIf();
   uint16_t handle = pTxCh->getHandle();
-#else
-  (void)len;
-#endif
 
   uint16_t ids[MAX_CONN];
   int n = snapshotConns(ids);
@@ -261,24 +209,13 @@ void notifyToPhones(const uint8_t* data, size_t len) {
     size_t c = len - off;
     if (c > NOTIFY_CHUNK) c = NOTIFY_CHUNK;
 
-#if RELAY_MULTI_CONN
-    /* 逐连接发送：Arduino 原生 notify() 只作用于一个 conn_id，
-       多设备必须直接调 IDF 接口指定目标连接。 */
     for (int i = 0; i < n; i++) {
       esp_ble_gatts_send_indicate(gGattsIf, ids[i], handle, (uint16_t)c,
                                   (uint8_t*)(data + off), false);
     }
-#else
-    /* 单连接降级模式：只发往当前活动的连接 */
-    pTxCh->setValue((uint8_t*)(data + off), c);
-    pTxCh->notify();
-#endif
-
-    /* 给协议栈留出排空时间，否则发送队列(默认32项)溢出导致丢包 */
     delay(6);
   }
 }
-
 /* ======================= 从 BMS 收到的字节流重组 ======================= */
 static uint8_t rxbuf[1024];
 static size_t  rxlen = 0;
@@ -477,7 +414,7 @@ void initBle() {
 
   /* 注册 GATTS 回调，从 ESP_GATTS_REG_EVT 里抓 gatts_if
    * （不依赖 BLEServer::getGattsIf，那个在某些 core 未公开）*/
-  esp_ble_gatts_register_callback(relayGattsRegCb);
+ //esp_ble_gatts_register_callback(relayGattsRegCb);
 
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
@@ -490,21 +427,14 @@ void initBle() {
 
   Serial.printf("[BLE] 广播名 = %s\n", cfgRelayName.c_str());
 }
-
 void applyRelayName(const String& nm) {
   cfgRelayName = nm;
   BLEDevice::stopAdvertising();
   delay(120);
-  /* esp_ble_gap_set_device_name 在某些精简 core 里没有声明。
-   * BLEDevice 提供的是 setDeviceName/ init 两种途径；改名其实只需
-   * 重新 init 广播名，但 init 不能重入。折中：用 BLEDevice::setDeviceName（若可用），
-   * 否则仅重启广播（广播包里的名字由 init 时确定，改名需重启模块才彻底生效）。 */
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  BLEDevice::setDeviceName(nm);
-#else
-  extern "C" esp_err_t esp_ble_gap_set_device_name(const char* name);
+  
+  // 直接调用官方底层接口修改蓝牙名称
   esp_ble_gap_set_device_name(nm.c_str());
-#endif
+  
   delay(120);
   BLEDevice::startAdvertising();
   Serial.printf("[BLE] 广播名已改为 %s\n", cfgRelayName.c_str());
