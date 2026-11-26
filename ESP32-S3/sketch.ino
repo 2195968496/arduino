@@ -351,6 +351,68 @@ void pollBms() {
   bmsCh->writeValue(f, n, true);
 }
 
+/* ==================== 连接后读取设备名（GAP 0x2A00） ==================== */
+/* 为什么需要这个：
+ *   BLE 设备名有两个来源 —— 广播包里的 Local Name（AD type 0x08/0x09），
+ *   或 GAP 服务(0x1800) 下的 Device Name 特征(0x2A00)。
+ *   很多设备（含部分 BMS）**广播包里根本不放名字**，官方 App 之所以能显示，
+ *   是它连上以后去读 0x2A00 拿到的。
+ *   读这个特征**不需要配对/绑定**，只要设备可连接即可。
+ *
+ * 该函数会临时建立一条连接，读完立即断开，不影响主链路。
+ * 为省内存，探针客户端只创建一次并复用。
+ */
+static BLEClient* probeClient = nullptr;
+
+bool readRemoteDeviceName(const String& mac, String& outName, String& err) {
+  outName = "";
+  err = "";
+  if (mac.length() != 17) { err = "地址格式不对"; return false; }
+
+  /* 正在中继 BMS 时不要抢占射频 */
+  if (bmsConnected) { err = "正在中继 BMS，请先暂停再读取"; return false; }
+
+  if (probeClient == nullptr) {
+    probeClient = BLEDevice::createClient();
+    if (probeClient == nullptr) { err = "创建客户端失败"; return false; }
+  }
+
+  BLEDevice::stopAdvertising();          /* 让出射频，提高连接成功率 */
+  delay(120);
+
+  bool ok = false;
+  if (!probeClient->connect(BLEAddress(mac))) {
+    err = "连接失败（设备可能已被其他主机占用）";
+  } else {
+    /* GAP 服务 0x1800 → Device Name 特征 0x2A00 */
+    BLERemoteService* gap = probeClient->getService(
+        BLEUUID("00001800-0000-1000-8000-00805F9B34FB"));
+    if (gap == nullptr) {
+      err = "设备没有 GAP 服务";
+    } else {
+      BLERemoteCharacteristic* ch = gap->getCharacteristic(
+          BLEUUID("00002A00-0000-1000-8000-00805F9B34FB"));
+      if (ch == nullptr) {
+        err = "设备没有名称特征";
+      } else if (!ch->canRead()) {
+        err = "名称特征不可读";
+      } else {
+        /* readValue() 在不同版本返回 String 或 std::string，
+         * 统一用 .c_str() 包一层，两种都能编过。 */
+        String v(ch->readValue().c_str());
+        v.trim();
+        if (v.length() > 0) { outName = v; ok = true; }
+        else err = "设备名称为空";
+      }
+    }
+    probeClient->disconnect();
+  }
+
+  delay(150);
+  BLEDevice::startAdvertising();         /* 恢复广播 */
+  return ok;
+}
+
 /* ============================ BLE Server 侧 ============================ */
 volatile bool gNeedRestartAdv = false;
 
@@ -445,6 +507,8 @@ struct ScanItem {
   int    rssi;
   bool   isAnt;
   bool   hasName;
+  bool   guessed;      /* 名字是从厂商数据里推断出来的 */
+  bool   cached;       /* 名字来自本机缓存的已保存设备（对应 Android 的 device.name 缓存） */
 };
 
 static ScanItem gScanList[SCAN_MAX];
@@ -535,9 +599,13 @@ input{flex:1}
 </div>
 
 <div class="card">
-  <h2>1. 选择中继设备（蚂蚁 BMS）</h2>
+  <h2>1. 选择中继设备</h2>
   <div class="row">
-    <button id="bs" onclick="doScan()">扫描附近 ANT 设备</button>
+    <button id="bs" onclick="doScan()">扫描附近蓝牙设备</button>
+  </div>
+  <div class="row">
+    <input id="q" type="text" placeholder="搜索：名称或地址（如 ANT、C4:1A）"
+           oninput="renderDevices()" autocomplete="off">
   </div>
   <div id="list" class="mut">尚未扫描</div>
   <div class="mut">已选中：<b id="sel">—</b></div>
@@ -613,62 +681,89 @@ function st(){
  }).catch(()=>{});
 }
 function doScan(){
- var b=document.getElementById('bs'); b.disabled=true; b.textContent='扫描中（约8秒）…';
+ var b=document.getElementById('bs'); b.disabled=true; b.textContent='扫描中（约14秒）…';
  document.getElementById('list').textContent='正在扫描，请稍候…';
  fetch('/scan').then(r=>r.json()).then(j=>{
-   var L=document.getElementById('list'); L.innerHTML='';
-   if(j.scanning){L.textContent='扫描进行中，请稍后再试';b.disabled=false;b.textContent='重新扫描';return;}
-   var head=document.createElement('div');
-   head.className='mut';
-   head.style.marginBottom='6px';
-   head.innerHTML='收到广播 <b>'+(j.raw||0)+'</b> 次，去重后 <b>'+(j.count||0)+'</b> 台';
-   L.appendChild(head);
-
-   if(!j.list || !j.list.length){
-     L.appendChild(document.createTextNode('没有发现任何蓝牙设备。'));
-     if((j.raw||0)===0){
-       var tip=document.createElement('div');
-       tip.className='mut'; tip.style.marginTop='6px';
-       tip.innerHTML='<b style="color:#dc2626">广播回调为 0</b>：射频未收到任何包。'
-         +'请确认 BMS 已上电、在 10 米内；若 BMS 正被其他主机连接，可能不广播。';
-       L.appendChild(tip);
-     }
-     b.disabled=false; b.textContent='重新扫描';
-     return;
-   }
-
-   var ants=0;
-   j.list.forEach(d=>{
-     if(d.ant) ants++;
-     var e=document.createElement('div');
-     e.className='dev'+(d.addr==chosen?' sel':'');
-     var tag = d.ant ? '<span style="color:#16a34a;font-weight:600"> [ANT]</span>' : '';
-     var warn = (!d.hasName) ? '<span style="color:#f59e0b"> [无名称]</span>' : '';
-     var saved = (d.addr==j.savedMac) ? '<span style="color:#2563eb;font-weight:600"> [当前目标]</span>' : '';
-     e.innerHTML='<b>'+d.name+'</b>'+tag+warn+saved
-                 +'<br><span style="color:#6b7280;font-size:12px">'
-                 +d.addr+'　RSSI '+d.rssi+' dBm</span>';
-     e.onclick=function(){
-       chosen=d.addr; chosenName=d.name;
-       document.getElementById('sel').textContent=chosen+' ('+d.name+')';
-       document.querySelectorAll('.dev').forEach(x=>x.classList.remove('sel'));
-       e.classList.add('sel');
-     };
-     L.appendChild(e);
-   });
-
-   var sum=document.createElement('div');
-   sum.className='mut'; sum.style.marginTop='8px';
-   sum.innerHTML = '以上是本次扫到的<b>全部</b> '+(j.count||0)+' 台设备（含无名称的），'
-     + '按信号强度从强到弱排列。<br>点任意一条即可选中，点「保存配置」后开始连接。'
-     + (ants>0 ? '<br>其中 <b style="color:#16a34a">'+ants+'</b> 台广播名以 ANT 开头，很可能是你的 BMS。' : '');
-   L.appendChild(sum);
-
+   if(j.scanning){document.getElementById('list').textContent='扫描进行中，请稍后再试';
+     b.disabled=false;b.textContent='重新扫描';return;}
+   window.allDevices = j.list || [];
+   window.scanMeta = {raw: j.raw||0, count: j.count||0, savedMac: j.savedMac||''};
+   renderDevices();
    b.disabled=false; b.textContent='重新扫描';
  }).catch(e=>{
    document.getElementById('list').textContent='扫描请求失败：'+e;
    b.disabled=false; b.textContent='重新扫描';
  });
+}
+
+/* 只负责“把 allDevices 按搜索框过滤后画出来”，不发请求 */
+function renderDevices(){
+ var L=document.getElementById('list');
+ var devs=window.allDevices||[];
+ var meta=window.scanMeta||{raw:0,count:0,savedMac:''};
+ L.innerHTML='';
+
+ if(!devs.length){
+   L.textContent = meta.raw>0 ? '没有发现任何蓝牙设备。' : '尚未扫描，或射频未收到任何广播。';
+   return;
+ }
+
+ var q=(document.getElementById('q').value||'').trim().toUpperCase();
+ var shown=0, ants=0;
+
+ // 统计（不受搜索影响）
+ devs.forEach(d=>{ if(d.ant) ants++; });
+
+ devs.forEach(d=>{
+   var hay=(d.name+' '+d.addr).toUpperCase();
+   if(q && hay.indexOf(q)<0) return;
+   shown++;
+
+   var e=document.createElement('div');
+   e.className='dev'+(d.addr==chosen?' sel':'');
+   var tag   = d.ant ? '<span style="color:#16a34a;font-weight:600"> [ANT]</span>' : '';
+   var warn  = (!d.hasName) ? '<span style="color:#f59e0b"> [无名称]</span>' : '';
+   var gtag  = d.guess ? '<span style="color:#8b5cf6;font-weight:600"> [厂商数据]</span>' : '';
+   var ctag  = d.cached ? '<span style="color:#0ea5e9;font-weight:600"> [已保存]</span>' : '';
+   var saved = (d.addr==meta.savedMac) ? '<span style="color:#2563eb;font-weight:600"> [当前目标]</span>' : '';
+   e.innerHTML='<b>'+d.name+'</b>'+tag+warn+gtag+ctag+saved
+               +'<br><span style="color:#6b7280;font-size:12px">'
+               +d.addr+'　RSSI '+d.rssi+' dBm</span>';
+   e.onclick=function(){
+     chosen=d.addr; chosenName=d.name;
+     document.getElementById('sel').textContent=chosen+' ('+d.name+')';
+     document.querySelectorAll('.dev').forEach(x=>x.classList.remove('sel'));
+     e.classList.add('sel');
+   };
+
+   /* 无名称的设备：提供"连上去读名称"的按钮（读 GAP 0x2A00） */
+   if(!d.hasName){
+     var btn=document.createElement('button');
+     btn.textContent='读取名称';
+     btn.style.marginTop='6px';
+     btn.style.fontSize='12px';
+     btn.style.padding='5px 10px';
+     btn.onclick=function(ev){ ev.stopPropagation(); readName(d.addr, btn); };
+     e.appendChild(btn);
+   }
+
+   L.appendChild(e);
+ });
+
+ if(!shown){
+   var none=document.createElement('div');
+   none.className='mut';
+   none.textContent='没有匹配「'+q+'」的设备，共扫到 '+devs.length+' 台，可清空搜索框查看全部。';
+   L.appendChild(none);
+   return;
+ }
+
+ var sum=document.createElement('div');
+ sum.className='mut'; sum.style.marginTop='8px';
+ sum.innerHTML='共 '+devs.length+' 台'+(q?('，匹配 '+shown+' 台'):'')
+   +'，按信号强度排序。点任意一条即可选中。'
+   +(ants>0?('<br>其中 <b style="color:#16a34a">'+ants+'</b> 台广播名含 ANT。'):'');
+ L.appendChild(sum);
 }
 document.getElementById('txp').addEventListener('change',function(){
   this.dataset.touched='1';
@@ -686,13 +781,62 @@ function doSave(){
   .then(r=>r.text()).then(t=>{m.textContent=t;st();})
   .catch(()=>{m.textContent='保存失败';});
 }
+/* 连上去读设备名（GAP 0x2A00）。成功后回填列表并选中 */
+function readName(addr, btn){
+ var old = btn ? btn.textContent : '';
+ if(btn){ btn.disabled=true; btn.textContent='读取中…'; }
+ fetch('/name?addr='+encodeURIComponent(addr)).then(r=>r.json()).then(j=>{
+   if(j.ok){
+     (window.allDevices||[]).forEach(d=>{
+       if(d.addr==addr){ d.name=j.name; d.hasName=true; }
+     });
+     if(btn){ btn.disabled=false; btn.textContent=old; }
+     renderDevices();
+   } else {
+     if(btn){ btn.disabled=false; btn.textContent=old; }
+     alert('读取失败：'+(j.err||'未知原因'));
+   }
+ }).catch(e=>{
+   if(btn){ btn.disabled=false; btn.textContent=old; }
+   alert('请求失败：'+e);
+ });
+}
+
 function wifiCtl(a){
  fetch('/wifi?act='+a).then(r=>r.text()).then(()=>st()).catch(()=>{});
 }
 st(); setInterval(st,2000);
 </script></body></html>)HTML";
 
-/* ============================== 扫描回调 ============================== */
+/* ------------- 从厂商自定义数据里提取名称 ------------- */
+/* 为什么需要：
+ *   标准设备名在 AD type 0x08/0x09（Local Name），Arduino 的 getName() 只读这个。
+ *   但不少国产 BMS 把名字塞在 **厂商自定义数据（AD type 0xFF）** 里，
+ *   官方 App 自己按私有格式解析，所以它「扫描阶段就能显示名字」，
+ *   而我们的 getName() 返回空 —— 这就是差异的根源。
+ *
+ * 做法：把厂商数据当成字节流，找连续可打印字符（含 UTF-8 中文），
+ *   取最长的一段作为名字。属于启发式推断，界面上会标 [厂商数据]。
+ */
+static String extractVendorName(BLEAdvertisedDevice& dev) {
+  String raw(dev.getManufacturerData().c_str());
+  if (raw.length() == 0) return String("");
+
+  String best = "";
+  String cur  = "";
+  for (unsigned int i = 0; i < raw.length(); i++) {
+    uint8_t c = (uint8_t)raw[i];
+    /* 允许 ASCII 可见字符与 UTF-8 高位字节，排除控制字符 */
+    if (c >= 0x20 && c != 0x7F) {
+      cur += (char)c;
+    } else {
+      if (cur.length() > best.length() && cur.length() >= 4) best = cur;
+      cur = "";
+    }
+  }
+  if (cur.length() > best.length() && cur.length() >= 4) best = cur;
+  return best;
+}
 /* 3.3.4 的实际签名（编译器报错原文给出）：
  *     virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;
  *
@@ -707,25 +851,48 @@ st(); setInterval(st,2000);
 class ScanCb : public BLEAdvertisedDeviceCallbacks {
 public:
   void onResult(BLEAdvertisedDevice dev) override {
-    /* 统计所有回调，无论是否过滤 */
     gScanRawCount++;
 
     String addr = String(dev.getAddress().toString().c_str());
-    if (addr.length() < 11) return;          /* 地址异常，跳过 */
+    if (addr.length() < 11) return;
 
-    /* 去重：同一设备可能被回调多次 */
+    String nm = String(dev.getName().c_str());
+    bool hasName = (nm.length() > 0);
+    bool guessed = false;
+
+    /* 标准 Local Name 没有时，尝试从厂商自定义数据(0xFF)里找名字。
+     * 官方 App 能"扫描阶段就显示名字"，往往就是因为它解析了这一段。 */
+    if (!hasName) {
+      String vn = extractVendorName(dev);
+      if (vn.length() > 0) {
+        nm = vn;
+        hasName = true;
+        guessed = true;
+      }
+    }
+
+    String up = nm; up.toUpperCase();
+    bool isAnt = hasName && (up.startsWith("ANT") || up.indexOf("ANT") >= 0);
+
+    /* 去重 + 【合并名字】
+     * 同一设备会被回调两次：先 ADV_IND（常无名字），后 SCAN_RSP（名字在这里）。
+     * 旧代码在此处直接 return，只更新 RSSI，导致后到的名字被丢弃，
+     * 表里永远显示"(无名称)"。这就是"App 能显示名字，我们显示无名称"的原因。 */
     for (int i = 0; i < gScanCount; i++) {
       if (gScanList[i].addr == addr) {
-        gScanList[i].rssi = dev.getRSSI();   /* 刷新 RSSI */
+        gScanList[i].rssi = dev.getRSSI();
+        if (hasName && !gScanList[i].hasName) {     /* 补上后到的名字 */
+          gScanList[i].name    = nm;
+          gScanList[i].hasName = true;
+          gScanList[i].isAnt   = isAnt;
+          gScanList[i].guessed = guessed;
+          Serial.printf("[Scan] 补到名字 %s -> %s%s\n",
+                        addr.c_str(), nm.c_str(), isAnt ? "  <== ANT" : "");
+        }
         return;
       }
     }
     if (gScanCount >= SCAN_MAX) return;
-
-    String nm = String(dev.getName().c_str());
-    bool hasName = (nm.length() > 0);
-    String up = nm; up.toUpperCase();
-    bool isAnt = hasName && up.startsWith("ANT");
 
     ScanItem& it = gScanList[gScanCount++];
     it.addr    = addr;
@@ -733,9 +900,12 @@ public:
     it.rssi    = dev.getRSSI();
     it.isAnt   = isAnt;
     it.hasName = hasName;
+    it.guessed = guessed;
+    it.cached  = false;
 
-    Serial.printf("[Scan] %s  %s  rssi=%d%s\n",
+    Serial.printf("[Scan] %s  %s  rssi=%d%s%s\n",
                   addr.c_str(), it.name.c_str(), it.rssi,
+                  guessed ? "  <厂商数据>" : "",
                   isAnt ? "  <== ANT" : "");
   }
 };
@@ -788,11 +958,16 @@ void handleScan() {
   gScanRawCount = 0;
 
   BLEScan* sc = BLEDevice::getScan();
-  sc->setAdvertisedDeviceCallbacks(new ScanCb(), false);
+  /* 第二个参数 wantDuplicates **必须为 true**。
+   * 它控制"同一地址的重复上报是否交给回调"。
+   * 设为 false 时，ADV_IND（无名）先到并被采纳，随后 SCAN_RSP（带名字）
+   * 会被库当作重复上报直接丢弃 —— 结果是永远拿不到名字。
+   * 这正是"能扫到设备、但显示无名称"的直接原因。 */
+  sc->setAdvertisedDeviceCallbacks(new ScanCb(), true);
   sc->setActiveScan(true);        /* 主动扫描，发 SCAN_REQ 索取 scan response 里的名字 */
   sc->setInterval(100);
   sc->setWindow(99);              /* 99/100 占空比，尽量不漏包 */
-  sc->setDuplicateFilter(false);  /* 关掉库内去重，否则名字更新收不到 */
+  sc->setDuplicateFilter(false);  /* 控制器层也关掉重复过滤 */
 
   Serial.println("[Scan] 开始扫描 8 秒…");
   gScanning = true;
@@ -857,6 +1032,23 @@ void handleScan() {
     gScanList[j + 1] = key;
   }
 
+  /* 用本机缓存的名称回填。
+   * 对应 Android 的 result.device.name —— 系统蓝牙栈会缓存设备名，
+   * 所以官方 App 即使广播里没有名字，也能显示上次连过的名字。
+   * 我们这边等价物就是 NVS 里的 gBmsList（连上时记下的名字）。 */
+  for (int i = 0; i < gScanCount; i++) {
+    if (gScanList[i].hasName) continue;
+    for (int k = 0; k < gBmsCount; k++) {
+      if (gBmsList[k].mac == gScanList[i].addr && gBmsList[k].name.length() > 0) {
+        gScanList[i].name    = gBmsList[k].name;
+        gScanList[i].hasName = true;
+        gScanList[i].cached  = true;
+        gScanList[i].isAnt   = true;
+        break;
+      }
+    }
+  }
+
   /* 手工拼 JSON，避免 String 反复 substring 出错 */
   String out = "{";
   out += "\"scanning\":false,";
@@ -871,6 +1063,8 @@ void handleScan() {
     out += "\"name\":\"" + gScanList[i].name + "\",";
     out += "\"rssi\":" + String(gScanList[i].rssi) + ",";
     out += "\"ant\":" + String(gScanList[i].isAnt ? 1 : 0) + ",";
+    out += "\"guess\":" + String(gScanList[i].guessed ? 1 : 0) + ",";
+    out += "\"cached\":" + String(gScanList[i].cached ? 1 : 0) + ",";
     out += "\"hasName\":" + String(gScanList[i].hasName ? 1 : 0);
     out += "}";
   }
@@ -938,6 +1132,22 @@ void handleSave() {
 
 void handleStatus() { server.send(200, "application/json", statusJson()); }
 
+/* /name?addr=xx:xx:... —— 连接该设备并读取 GAP 名称特征(0x2A00) */
+void handleReadName() {
+  String addr = server.arg("addr");
+  addr.trim();
+
+  String nm, err;
+  bool ok = readRemoteDeviceName(addr, nm, err);
+
+  String out = "{";
+  out += "\"ok\":" + String(ok ? 1 : 0);
+  out += ",\"name\":\"" + nm + "\"";
+  out += ",\"err\":\"" + err + "\"";
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
 void handleWifiCtl() {
   String act = server.arg("act");
   if (act == "off") {
@@ -961,6 +1171,7 @@ void registerRoutes() {
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/name", HTTP_GET, handleReadName);
   server.on("/wifi", HTTP_GET, handleWifiCtl);
   server.onNotFound(handleNotFound);
   routesRegistered = true;
@@ -1153,7 +1364,7 @@ void bmsConnTick() {
   gScanCount = 0;
   gScanRawCount = 0;
   BLEScan* sc = BLEDevice::getScan();
-  sc->setAdvertisedDeviceCallbacks(new ScanCb(), false);
+  sc->setAdvertisedDeviceCallbacks(new ScanCb(), true);   /* true：允许重复上报，才能收到带名字的 SCAN_RSP */
   sc->setActiveScan(true);
   sc->setInterval(100);
   sc->setWindow(99);
