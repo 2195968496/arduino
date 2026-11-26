@@ -40,16 +40,20 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-/* esp32 core 3.3.4（官方完整版）的 include 路径是完整的，
- * 显式包含底层头文件可避免依赖 BLEDevice.h 的传递包含，更稳妥。
- * 用到的符号来源：
- *   esp_power_level_t / ESP_PWR_LVL_* / esp_ble_tx_power_set  → esp_bt.h
- *   esp_ble_gap_set_device_name                              → esp_gap_ble_api.h
- *   esp_ble_gatts_send_indicate / esp_gatt_if_t               → esp_gatts_api.h
- */
-#include <esp_bt.h>
+/* 关于 IDF 底层头文件（esp_gap_ble_api.h / esp_gatts_api.h）：
+ * 不要在这里直接 #include —— arduino-esp32 的 sketch 编译路径并不完整暴露
+ * IDF 头文件（实测 3.3.4 下 esp_bt.h 能找到，但 esp_gap_ble_api.h 找不到）。
+ * 而 BLEDevice.h → BLEServer.h / BLEScan.h 这条链内部会包含它们，
+ * 因此 esp_gatt_if_t / esp_ble_gatts_send_indicate / esp_ble_gap_set_device_name
+ * 这些符号都能通过 BLE 库传递获得。
+ *
+ * 下面用 __has_include 做保险：能找到就包含（无害），找不到就跳过。 */
+#if __has_include(<esp_gap_ble_api.h>)
 #include <esp_gap_ble_api.h>
+#endif
+#if __has_include(<esp_gatts_api.h>)
 #include <esp_gatts_api.h>
+#endif
 
 /* ------------------------------ 可改配置 ------------------------------ */
 static const char* AP_SSID = "Ant-Bms";
