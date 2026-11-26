@@ -435,7 +435,9 @@ void bmsRemember(const String& mac, const String& name);   /* 后置定义 */
 void bmsForget(const String& mac);
 
 /* ---------------------------- 扫描结果存储 ---------------------------- */
-static const int SCAN_MAX = 20;
+/* 上限必须够大：周围设备多时（手机、耳机、手环…）20 个名额很容易被占满，
+ * 后出现的 BMS 就会被静默丢弃，表现为「别的都能扫到，就是没有 BMS」。 */
+static const int SCAN_MAX = 40;
 
 struct ScanItem {
   String addr;
@@ -642,9 +644,10 @@ function doScan(){
      e.className='dev'+(d.addr==chosen?' sel':'');
      var tag = d.ant ? '<span style="color:#16a34a;font-weight:600"> [ANT]</span>' : '';
      var warn = (!d.hasName) ? '<span style="color:#f59e0b"> [无名称]</span>' : '';
-     e.innerHTML='<b>'+d.name+'</b>'+tag+warn
+     var saved = (d.addr==j.savedMac) ? '<span style="color:#2563eb;font-weight:600"> [当前目标]</span>' : '';
+     e.innerHTML='<b>'+d.name+'</b>'+tag+warn+saved
                  +'<br><span style="color:#6b7280;font-size:12px">'
-                 +d.addr+'　RSSI '+d.rssi+'</span>';
+                 +d.addr+'　RSSI '+d.rssi+' dBm</span>';
      e.onclick=function(){
        chosen=d.addr; chosenName=d.name;
        document.getElementById('sel').textContent=chosen+' ('+d.name+')';
@@ -655,10 +658,10 @@ function doScan(){
    });
 
    var sum=document.createElement('div');
-   sum.className='mut'; sum.style.marginTop='6px';
-   sum.innerHTML = ants>0
-     ? '其中 <b style="color:#16a34a">'+ants+'</b> 台被识别为 ANT（蚂蚁 BMS）。点选后保存即可。'
-     : '未发现名字以 <b>ANT</b> 开头的设备。若你的 BMS 广播名不同，可直接点选对应地址保存。';
+   sum.className='mut'; sum.style.marginTop='8px';
+   sum.innerHTML = '以上是本次扫到的<b>全部</b> '+(j.count||0)+' 台设备（含无名称的），'
+     + '按信号强度从强到弱排列。<br>点任意一条即可选中，点「保存配置」后开始连接。'
+     + (ants>0 ? '<br>其中 <b style="color:#16a34a">'+ants+'</b> 台广播名以 ANT 开头，很可能是你的 BMS。' : '');
    L.appendChild(sum);
 
    b.disabled=false; b.textContent='重新扫描';
@@ -813,12 +816,20 @@ void handleScan() {
     delay(300);
   }
 
-  /* 阻塞扫描 8 秒：期间 loop() 不跑，Web 请求会排队。
-     代价是扫描时页面短暂无响应，换来的是结果确定、无并发问题。 */
-  sc->start(8, false);
-  while (sc->isScanning()) {
-    delay(50);
-  }
+  /* 阻塞扫描：分两轮、每轮 7 秒，结果合并到同一张表。
+   * 为什么要两轮：BMS 这类设备的广播间隔可能较长（几百 ms 到 2 s），
+   * 单轮短扫描容易整轮都没撞上它的广播点；两轮能显著提高命中率。
+   * 期间 loop() 不跑，Web 请求会排队，但换来结果确定、无并发问题。 */
+  sc->start(7, false);
+  while (sc->isScanning()) delay(50);
+  sc->stop();
+  sc->clearResults();
+
+  Serial.printf("[Scan] 第 1 轮结束：回调 %d 次，累计 %d 台\n",
+                gScanRawCount, gScanCount);
+
+  sc->start(7, false);
+  while (sc->isScanning()) delay(50);
   sc->stop();
   sc->clearResults();
 
@@ -834,11 +845,24 @@ void handleScan() {
   Serial.printf("[Scan] 结束：广播回调 %d 次，去重后 %d 台\n",
                 gScanRawCount, gScanCount);
 
+  /* 按 RSSI 从强到弱排序（纯展示顺序，不筛选、不丢弃任何设备）。
+   * 目的：设备多时把距离近的排前面，BMS 通常在附近，一眼能看到。 */
+  for (int i = 1; i < gScanCount; i++) {
+    ScanItem key = gScanList[i];
+    int j = i - 1;
+    while (j >= 0 && gScanList[j].rssi < key.rssi) {
+      gScanList[j + 1] = gScanList[j];
+      j--;
+    }
+    gScanList[j + 1] = key;
+  }
+
   /* 手工拼 JSON，避免 String 反复 substring 出错 */
   String out = "{";
   out += "\"scanning\":false,";
   out += "\"raw\":" + String(gScanRawCount) + ",";
   out += "\"count\":" + String(gScanCount) + ",";
+  out += "\"savedMac\":\"" + cfgBmsMac + "\",";   /* 前端用它标出「当前目标」 */
   out += "\"list\":[";
   for (int i = 0; i < gScanCount; i++) {
     if (i) out += ",";
