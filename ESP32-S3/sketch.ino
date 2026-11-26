@@ -39,21 +39,10 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-
-/* 关于 IDF 底层头文件（esp_gap_ble_api.h / esp_gatts_api.h）：
- * 不要在这里直接 #include —— arduino-esp32 的 sketch 编译路径并不完整暴露
- * IDF 头文件（实测 3.3.4 下 esp_bt.h 能找到，但 esp_gap_ble_api.h 找不到）。
- * 而 BLEDevice.h → BLEServer.h / BLEScan.h 这条链内部会包含它们，
- * 因此 esp_gatt_if_t / esp_ble_gatts_send_indicate / esp_ble_gap_set_device_name
- * 这些符号都能通过 BLE 库传递获得。
- *
- * 下面用 __has_include 做保险：能找到就包含（无害），找不到就跳过。 */
-#if __has_include(<esp_gap_ble_api.h>)
-#include <esp_gap_ble_api.h>
-#endif
-#if __has_include(<esp_gatts_api.h>)
-#include <esp_gatts_api.h>
-#endif
+/* esp_bt.h 在 3.3.4 的 sketch 路径下可正常解析（上一轮日志第 50 行未报错），
+ * 它提供 esp_power_level_t / ESP_PWR_LVL_* / esp_ble_tx_power_set。
+ * 注意：不要 include esp_gap_ble_api.h / esp_gatts_api.h —— 那两个找不到。 */
+#include <esp_bt.h>
 
 /* ------------------------------ 可改配置 ------------------------------ */
 static const char* AP_SSID = "Ant-Bms";
@@ -109,39 +98,11 @@ bool wifiOn = false;
 bool wifiIdleCounting = false;
 uint32_t wifiIdleStart = 0;
 
-/* ---------------------------- 多连接跟踪 ---------------------------- */
-static uint16_t connIds[MAX_CONN];
-static volatile int connCount = 0;
-static portMUX_TYPE connMux = portMUX_INITIALIZER_UNLOCKED;
-
-void addConn(uint16_t id) {
-  portENTER_CRITICAL(&connMux);
-  bool found = false;
-  for (int i = 0; i < connCount; i++) if (connIds[i] == id) found = true;
-  if (!found && connCount < MAX_CONN) connIds[connCount++] = id;
-  portEXIT_CRITICAL(&connMux);
-}
-
-void removeConn(uint16_t id) {
-  portENTER_CRITICAL(&connMux);
-  for (int i = 0; i < connCount; i++) {
-    if (connIds[i] == id) {
-      for (int j = i; j < connCount - 1; j++) connIds[j] = connIds[j + 1];
-      connCount--;
-      break;
-    }
-  }
-  portEXIT_CRITICAL(&connMux);
-}
-
-int getConnCount() { return connCount; }
-
-int snapshotConns(uint16_t* out) {
-  portENTER_CRITICAL(&connMux);
-  int n = connCount;
-  for (int i = 0; i < n; i++) out[i] = connIds[i];
-  portEXIT_CRITICAL(&connMux);
-  return n;
+/* ---------------------------- 连接计数 ---------------------------- */
+/* 不再自己维护 conn_id 列表：既然发送走 notify()（库内部遍历所有 peer），
+ * 连接数直接问 BLEServer 即可，避免自维护状态与协议栈不一致。 */
+int getConnCount() {
+  return (pServer != nullptr) ? (int)pServer->getConnectedCount() : 0;
 }
 
 /* ---------------------------- CRC16-Modbus ---------------------------- */
@@ -175,6 +136,15 @@ size_t buildShortFrame(uint8_t* out, uint8_t addr, uint8_t fc,
 }
 
 /* ========================= 发射功率（5 档） ========================= */
+/* ESP32-S3 功放只有离散档位：-12/-9/-6/-3/0/+3/+6/+9 dBm。
+ *
+ * 这里**直接使用** esp_bt.h 提供的 API，不做任何自声明：
+ * 上一轮编译日志显示 esp_bt.h 是可见的（第 50 行未报错，
+ * 只有第 51 行的 esp_gap_ble_api.h 找不到），所以
+ * esp_power_level_t / ESP_PWR_LVL_* / esp_ble_tx_power_set 都是可用的。
+ *
+ * 若再自声明 extern "C" int esp_ble_tx_power_set(int,int)，
+ * 会与头文件里的真实原型冲突（C 链接不允许重载），反而编不过。 */
 static esp_power_level_t percentToPwrLevel(uint8_t pct) {
   if (pct <= 20) return ESP_PWR_LVL_N6;   /* -6 dBm */
   if (pct <= 40) return ESP_PWR_LVL_N0;   /*  0 dBm */
@@ -192,46 +162,39 @@ static const char* percentToDbmText(uint8_t pct) {
 }
 
 void applyTxPower(uint8_t pct) {
+  cfgTxPercent = pct;
   esp_power_level_t lv = percentToPwrLevel(pct);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, lv);      /* 广播包 */
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, lv);  /* 连接 */
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, lv);  /* 已建连接 */
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, lv);     /* 扫描 */
-  cfgTxPercent = pct;
   Serial.printf("[PWR] 发射功率 %u%% (%s)\n", (unsigned)pct, percentToDbmText(pct));
 }
 
 
 /* ========================= 向上（手机）转发 ========================= */
 /*
- * 3.3.4 的 BLECharacteristic 只有：
- *     void notify(bool is_notification = true);
- *     void indicate();
- * 没有「指定 conn_id」的重载（notify(data, len, connId) 在 3.3.4 不存在）。
+ * 只用 Arduino BLE 库的公开 API，不碰任何 IDF 底层符号。
  *
- * 所以多设备发送走 IDF 底层 esp_ble_gatts_send_indicate()。
- * 3.3.4 的 BLEDevice.h → BLEServer.h → esp_gatts_api.h 已完整引入该符号，
- * 无需自声明（自声明反而可能与头文件原型冲突）。
+ * 原因（由 3.3.4 编译器的报错确认）：
+ *   - BLEServer 在 3.3.4 里没有公开 getGattsIf()
+ *   - esp_ble_gatts_send_indicate 在 sketch 的 include 路径下未声明
+ * 所以不能手动逐连接发送。
  *
- * gatts_if 从 BLEServer::getGattsIf() 取 —— 3.x 是 public，可直接用。
+ * 改用 setValue() + notify()：3.x 的 BLECharacteristic::notify() 内部会遍历
+ * BLEServer 的所有已连接 peer（getPeerDevices）逐个发送，因此**多台手机可以同时收到**，
+ * 不需要我们自己拿 gatts_if。这是库内部做法，各版本都一致。
  */
 void notifyToPhones(const uint8_t* data, size_t len) {
   if (pTxCh == nullptr || pServer == nullptr) return;
-
-  uint16_t ids[MAX_CONN];
-  int n = snapshotConns(ids);
-  if (n == 0) return;                  /* 无手机连接，不必组包 */
-
-  uint16_t handle = pTxCh->getHandle();
-  esp_gatt_if_t gattsIf = pServer->getGattsIf();
+  if (pServer->getConnectedCount() == 0) return;   /* 无手机连接，不必组包 */
 
   for (size_t off = 0; off < len; off += NOTIFY_CHUNK) {
     size_t c = len - off;
     if (c > NOTIFY_CHUNK) c = NOTIFY_CHUNK;
 
-    for (int i = 0; i < n; i++) {
-      esp_ble_gatts_send_indicate(gattsIf, ids[i], handle,
-                                  (uint16_t)c, (uint8_t*)(data + off), false);
-    }
+    pTxCh->setValue((uint8_t*)(data + off), c);
+    pTxCh->notify();
+
     /* 给协议栈留出排空时间，否则发送队列溢出导致丢包 */
     delay(6);
   }
@@ -391,22 +354,16 @@ void pollBms() {
 /* ============================ BLE Server 侧 ============================ */
 volatile bool gNeedRestartAdv = false;
 
-/* 注意：这里必须用 BLEServer 给出的真实 conn_id。
- * esp_ble_gatts_send_indicate() 的 conn_id 参数是协议栈内部句柄，
- * 用自造序号会导致发送失败（且不报错，只是手机收不到）。
- * 你的编译报错里没有出现 getConnId，说明这个 core 是提供的，直接用。 */
+/* 连接/断开只做日志：连接数由 BLEServer::getConnectedCount() 提供，
+ * 不再自己维护 id 列表（发送由 notify() 内部遍历所有 peer 完成）。 */
 class PhoneServerCb : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
-    uint16_t id = s->getConnId();
-    addConn(id);
-    Serial.printf("[Phone] 连接 conn_id=%u，当前 %d/%d\n",
-                  (unsigned)id, getConnCount(), MAX_CONN);
+    (void)s;
+    Serial.printf("[Phone] 连接，当前 %d/%d\n", getConnCount(), MAX_CONN);
   }
   void onDisconnect(BLEServer* s) override {
-    uint16_t id = s->getConnId();
-    removeConn(id);
-    Serial.printf("[Phone] 断开 conn_id=%u，剩余 %d/%d\n",
-                  (unsigned)id, getConnCount(), MAX_CONN);
+    (void)s;
+    Serial.printf("[Phone] 断开，剩余 %d/%d\n", getConnCount(), MAX_CONN);
     gNeedRestartAdv = true;            /* 回调里禁止 delay，交主循环重启广播 */
   }
 };
@@ -445,18 +402,20 @@ void initBle() {
 }
 
 /* 运行时改广播名。
- * 3.3.4 的 BLEDevice 没有 setDeviceName()（那是别的框架/别的版本才有的）。
- * 3.3.4 里改设备名要用 IDF 的 esp_ble_gap_set_device_name()，
- * 它在 3.3.4 的 BLEDevice.h 链路里已声明，可直接调用。
- * 改名后必须重新 startAdvertising 才能让新名字出现在广播包里。 */
+ *
+ * 3.3.4 的 sketch 路径下 esp_ble_gap_set_device_name() 不可用，
+ * BLEDevice 也没有 setDeviceName()。BLE 库只在 init() 时把名字写进广播包，
+ * 之后没有公开接口能改。
+ *
+ * 因此这里改配置并持久化，重启广播让配置生效；但设备名要真正变化需要重启模块
+ * （BLE 协议栈不支持无重启改名）。页面与串口会明确提示这一点。 */
 void applyRelayName(const String& nm) {
   cfgRelayName = nm;
   BLEDevice::stopAdvertising();
   delay(120);
-  esp_ble_gap_set_device_name(nm.c_str());
-  delay(120);
   BLEDevice::startAdvertising();
-  Serial.printf("[BLE] 广播名已改为 %s\n", cfgRelayName.c_str());
+  Serial.printf("[BLE] 中继名已保存为 %s（广播名需重启模块后生效）\n",
+                cfgRelayName.c_str());
 }
 
 /* ============================== WiFi 控制 ============================== */
@@ -652,22 +611,21 @@ st(); setInterval(st,2000);
 </script></body></html>)HTML";
 
 /* ============================== 扫描回调 ============================== */
-/* esp32 core 3.x 的 BLEAdvertisedDeviceCallbacks::onResult 签名是
- *     void onResult(BLEAdvertisedDevice* dev)
- * 传指针。3.3.4 若写成传值重载会触发 -Woverloaded-virtual 并导致该类
- * 仍是抽象类。所以这里严格按 3.x 签名写，并加 override 让编译器校验。 */
+/* 3.3.4 的实际签名（编译器报错原文给出）：
+ *     virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;
+ * 是**传值**，不是传指针。之前按指针写导致 override 失败、类仍是抽象类。 */
 class ScanCb : public BLEAdvertisedDeviceCallbacks {
 public:
-  void onResult(BLEAdvertisedDevice* dev) override {
-    if (!dev || !gScanning) return;
-    String nm = String(dev->getName().c_str());
+  void onResult(BLEAdvertisedDevice dev) override {
+    if (!gScanning) return;
+    String nm = String(dev.getName().c_str());
     if (nm.length() == 0) return;
     String up = nm; up.toUpperCase();
     if (!up.startsWith("ANT")) return;
 
     String item = String("{\"name\":\"") + nm + "\",\"addr\":\"" +
-                  String(dev->getAddress().toString().c_str()) +
-                  "\",\"rssi\":" + String(dev->getRSSI()) + "}";
+                  String(dev.getAddress().toString().c_str()) +
+                  "\",\"rssi\":" + String(dev.getRSSI()) + "}";
     if (scanJson == "[]") scanJson = "[" + item + "]";
     else                  scanJson = scanJson.substring(0, scanJson.length() - 1) + "," + item + "]";
   }
