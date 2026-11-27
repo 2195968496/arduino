@@ -459,7 +459,12 @@ class PhoneServerCb : public BLEServerCallbacks {
     gPollNow = true;                 /* 有手机接入：下一轮立刻向 BMS 要一次数据 */
     gBmsSuspended = false;           /* 若处于深度休眠，立刻解除，让状态机去重连 */
     gIdleSince = 0;
-    Serial.printf("[Phone] 连接，当前 %d/%d\n", getConnCount(), MAX_CONN);
+    /* 关键：某些 core 在建立连接后会停止广播，导致第二台手机搜不到本机。
+       这里每次接入都要求主循环重启一次广播，保证后续设备仍可被发现。 */
+    gNeedRestartAdv = true;
+    Serial.printf("[Phone] 连接，当前 %d/%d（剩余可接入 %d 台）\n",
+                  getConnCount(), MAX_CONN,
+                  MAX_CONN - getConnCount() < 0 ? 0 : MAX_CONN - getConnCount());
   }
   void onDisconnect(BLEServer* s) override {
     (void)s;
